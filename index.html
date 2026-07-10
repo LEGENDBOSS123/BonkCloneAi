@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Parkour</title>
+    <style>
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #05080a; }
+      canvas { display: block; }
+    </style>
+
+    <!-- Resolve bare "pixi.js" imports in the .mjs modules to the CDN build. -->
+    <script type="importmap">
+      {
+        "imports": {
+          "pixi.js": "https://cdn.jsdelivr.net/npm/pixi.js@8.6.6/dist/pixi.min.mjs",
+          "planck": "https://cdn.jsdelivr.net/npm/planck@1/+esm"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <script type="module" src="./src/main.mjs"></script>
+  </body>
+</html>

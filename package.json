@@ -1,0 +1,12 @@
+{
+  "name": "bonkcloneai",
+  "private": true,
+  "type": "module",
+  "description": "Bonk.io-clone RL. Browser training: train2.html. Headless: node src/rl2/headless_node.mjs",
+  "dependencies": {
+    "@tensorflow/tfjs": "4.22.0",
+    "@tensorflow/tfjs-backend-wasm": "4.22.0",
+    "@tensorflow/tfjs-node": "^4.22.0",
+    "planck": "^1.4.2"
+  }
+}

@@ -1,0 +1,23 @@
+# Python
+python/.venv/
+**/__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# Training outputs — full checkpoints are 100+ MB each (they bundle the whole
+# snapshot + exploiter pool). Don't commit them; ship a slim model in models/
+# via `python -m bonk.export_model` instead.
+runs/
+metrics.jsonl
+
+# Scratch / local
+message.txt
+*.log
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

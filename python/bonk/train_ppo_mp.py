@@ -28,35 +28,54 @@ from .trainer import elo_update, mirror_action, mirror_obs
 REPO = Path(__file__).resolve().parents[2]
 
 # --- League (AlphaStar-lite) ---------------------------------------------------
-# Every EXPLOITER_INTERVAL main-agent episodes, main training PAUSES and a fresh
-# exploiter agent trains against the frozen current main (pure best-response —
+# When the main has mastered its pool (see EXPLOITER_TRIGGER_WR below), main
+# training PAUSES and a fresh exploiter agent trains against the frozen main
+# (pure best-response —
 # it exists to find the main agent's weaknesses). The finished exploiter's actor
 # joins the exploiter pool, and main training resumes with opponents drawn from
 # { current model, past snapshot, exploiter }, exploiters weighted by winrate.
 # Playing against its own exploiters forces the main agent to patch the exact
 # holes a dedicated adversary found — the league antidote to self-play cycling.
-EXPLOITER_INTERVAL = 200_000
+# Exploiter GENERATION is adaptive, not on a fixed clock: spawn a fresh exploiter
+# once the main has MASTERED its current pool — i.e. no frozen agent still beats
+# the main by more than EXPLOITER_TRIGGER_WR (the pool is "solved", time to find a
+# new hole). Guards: MIN_INTERVAL stops thrashing right after one joins; and a
+# MAX_INTERVAL fallback forces one periodically even if the condition never fires,
+# so a *persistent* hole (e.g. a juke the main can't patch, which keeps the top
+# pool winrate high forever) can't freeze exploiter generation and starve the
+# league of new holes. All spacing is in main-phase episodes.
+EXPLOITER_TRIGGER_WR = 0.55       # spawn when top pool winrate-vs-main drops below this
+EXPLOITER_MIN_INTERVAL = 30_000   # min main episodes between exploiter phases
+EXPLOITER_MAX_INTERVAL = 300_000  # force one at least this often (diversity floor)
+EXPLOITER_TRIGGER_MIN_GAMES = 30  # a pool agent needs this many recent games to count
 # Exploiter phase length is adaptive (AlphaStar's recipe: winrate gate +
 # timeout, not a fixed budget). Train at least MIN episodes; once the rolling
 # winrate vs the frozen main reaches TARGET_WR, sharpen for EXTRA more episodes
 # at low entropy and stop. MAX is the give-up timeout — a phase that never
 # finds a real exploit shouldn't keep eating main-agent training time.
 EXPLOITER_MIN_EPISODES = 20_000
-EXPLOITER_MAX_EPISODES = 500_000
-EXPLOITER_TARGET_WR = 0.75
+EXPLOITER_MAX_EPISODES = 150_000
+EXPLOITER_TARGET_WR = 0.7
 EXPLOITER_EXTRA_EPISODES = 10_000
 EXPLOITER_WR_WINDOW = 1000    # rolling winrate window (episodes)
 EXPLOITER_WARM_START = True   # exploiter starts from main's weights (faster);
                               # False = from scratch (weirder, slower exploits)
 EXPLOITER_POOL_MAX = 30
+# Main-phase opponents: ONE unified PFSP pool. The live current model is just
+# another member, entered at an assumed 50% winrate (loss rate 0.5); frozen
+# agents (snapshots + exploiters) are weighted by the main's live loss rate.
+# Sampling by loss rate means whoever the main currently loses to — current, a
+# past self, or an exploiter — gets the most games.
+CURRENT_PLAY_WEIGHT = 0.50  # current model's pool weight (assumed 50% winrate)
+PFSP_UNIFORM_MIX = 0.10     # uniform blend into the pool draw, for coverage
 # Exploiter entropy: with WARM_START, EC_START must stay LOW — a high entropy
 # bonus melts the transferred policy back to ~uniform (H -> ln(NUM_ACTIONS))
 # within a few thousand episodes, throwing away the warm start and forcing a
 # de-facto cold restart. Keep just enough entropy to bend the inherited policy
 # toward the exploit. (Cold start? Then raise this back to ~0.3.)
-EXPLOITER_EC_START = 0.05
+EXPLOITER_EC_START = 0.1
 EXPLOITER_EC_END = 0.01
-EXPLOITER_EC_DECAY_EPISODES = 40_000
+EXPLOITER_EC_DECAY_EPISODES = 10_000
 
 
 class MPPPOTrainer:
@@ -81,7 +100,7 @@ class MPPPOTrainer:
         self.exp_agent = None           # PPOAgent while an exploiter trains
         self.frozen_main = None         # frozen main actor (exploiter's opponent)
         self.main_ep_total = 0          # main-phase episodes (drives the interval)
-        self.next_exploiter_at = EXPLOITER_INTERVAL
+        self.last_exploiter_ep = 0      # main_ep_total when the last phase ended
         self.phase_eps = 0              # episodes inside the current exploiter phase
         self.exp_recent = []            # exploiter scores vs main (rolling)
         self.exp_gate_hit_at = None     # phase_eps when TARGET_WR was reached
@@ -108,48 +127,39 @@ class MPPPOTrainer:
             self.stream_o[i] = None
             self.pend_o[i] = None
             return
-        # Main phase: pick an opponent KIND, then an instance. Normally the kinds
-        # are weighted uniformly, but when a dominant exploiter exists (the main
-        # currently loses badly to some pool member) we over-sample the exploiter
-        # kind so the main gets enough exposure to actually patch the hole — a
-        # 1-in-3 diet is too little against a 90%+ exploiter.
-        kinds = ["current"]
-        kw = [1.0]
-        if self.snapshots:
-            kinds.append("snap")
-            kw.append(1.0)
-        if self.exploiters:
-            kinds.append("exp")
-            # Weight = how hard the scariest live exploiter beats the main. At
-            # ~50% (main holds its own) this is ~1 (uniform); at 90% it's ~3x.
-            top = max(self._exp_weight(e) for e in self.exploiters)
-            kw.append(1.0 + 4.0 * max(0.0, top - 0.5))
-        kw = np.array(kw)
-        kind = kinds[np.random.choice(len(kinds), p=kw / kw.sum())]
+        # Main phase: ONE unified PFSP pool that includes the live current model
+        # as a member (assumed 50% winrate) alongside every frozen agent. One
+        # pool avoids the two-level distortion where an agent in a smaller bucket
+        # gets over-sampled for its bucket size; whoever the main loses to most —
+        # current, a past self, or an exploiter — surfaces most.
+        kind, idx = self._sample_opponent()
         if kind == "current":
             self.opp[i] = ("current", None)
-            self.stream_o[i] = self._stream()
-        elif kind == "snap":
-            # PFSP over past selves: concentrate the snapshot budget on the
-            # versions the main currently LOSES to, instead of spreading it
-            # uniformly (which dilutes each of 50 snapshots to ~0.6% and lets
-            # the main cycle freely). Beating your own past is the fictitious-
-            # play pressure that turns cycling into monotonic improvement.
-            w = np.array([self._snap_weight(s) for s in self.snapshots])
-            self.opp[i] = ("snap", int(np.random.choice(len(self.snapshots),
-                                                        p=w / w.sum())))
-            self.stream_o[i] = None
+            self.stream_o[i] = self._stream()   # both seats are the learner -> both train
         else:
-            # PFSP-style: sample exploiters by how often the main STILL loses to
-            # them (live, not frozen). Once the main patches a hole the exploiter
-            # exposed, that exploiter's live winrate collapses, its weight drops,
-            # and the main moves on to unsolved ones. Falls back to the
-            # graduation winrate until an exploiter has been played enough.
-            w = np.array([self._exp_weight(e) for e in self.exploiters])
-            self.opp[i] = ("exp", int(np.random.choice(len(self.exploiters),
-                                                       p=w / w.sum())))
+            self.opp[i] = (kind, idx)
             self.stream_o[i] = None
         self.pend_o[i] = None
+
+    def _sample_opponent(self):
+        """Unified PFSP over current + all frozen agents. Weight = the main's
+        loss rate against each (current fixed at CURRENT_PLAY_WEIGHT, snapshots/
+        exploiters via _snap/_exp_weight, floored), with a uniform blend for
+        coverage. Current is always present, so the pool is never empty. Frozen
+        agents stay in separate lists (eviction / exploiter-generation untouched)
+        but are SAMPLED as one population."""
+        pool = [("current", None, CURRENT_PLAY_WEIGHT)]
+        pool += [("snap", j, self._snap_weight(s))
+                 for j, s in enumerate(self.snapshots)]
+        pool += [("exp", j, self._exp_weight(e))
+                 for j, e in enumerate(self.exploiters)]
+        w = np.array([x[2] for x in pool], dtype=np.float64)
+        w = w / w.sum()
+        if PFSP_UNIFORM_MIX > 0.0:              # coverage floor over the whole pool
+            w = (1.0 - PFSP_UNIFORM_MIX) * w + PFSP_UNIFORM_MIX / len(pool)
+        k = int(np.random.choice(len(pool), p=w))
+        kind, idx, _ = pool[k]
+        return kind, idx
 
     def _snap_weight(self, s):
         """Live sampling weight for a past-self snapshot = the main's recent
@@ -298,12 +308,49 @@ class MPPPOTrainer:
                     if self.opp[j][0] == "snap":
                         self.opp[j] = ("snap", max(0, self.opp[j][1] - 1))
 
-        if self.main_ep_total >= self.next_exploiter_at:
+        if self._should_start_exploiter():
             self._start_exploiter()
         else:
             self._select_opponent(i)
 
     # --- league phase transitions ---------------------------------------------
+    def _top_pool_winrate(self):
+        """Highest winrate any frozen pool agent currently holds AGAINST the main
+        (= the main's highest live loss rate), over agents with enough games.
+        None if no agent has enough data yet."""
+        rates = [1.0 - sum(a["recent"]) / len(a["recent"])
+                 for a in (self.snapshots + self.exploiters)
+                 if len(a["recent"]) >= EXPLOITER_TRIGGER_MIN_GAMES]
+        return max(rates) if rates else None
+
+    def pool_status(self):
+        """For logging: (top_wr, 'id', n_losing) — the highest winrate any pool
+        agent holds vs the main, which agent it is, and how many agents still
+        beat the main (>50%). Only counts agents with enough games."""
+        best_wr, best_id, losing = None, "-", 0
+        for kind, lst in (("snap", self.snapshots), ("exp", self.exploiters)):
+            for j, a in enumerate(lst):
+                r = a["recent"]
+                if len(r) < EXPLOITER_TRIGGER_MIN_GAMES:
+                    continue
+                wr = 1.0 - sum(r) / len(r)
+                if wr > 0.5:
+                    losing += 1
+                if best_wr is None or wr > best_wr:
+                    best_wr, best_id = wr, f"{kind}{j}"
+        return best_wr, best_id, losing
+
+    def _should_start_exploiter(self):
+        """Spawn a new exploiter once the main has mastered the pool (no agent
+        beats it by more than EXPLOITER_TRIGGER_WR), bounded by min/max spacing."""
+        gap = self.main_ep_total - self.last_exploiter_ep
+        if gap < EXPLOITER_MIN_INTERVAL:
+            return False                       # let the main absorb the last one
+        if gap >= EXPLOITER_MAX_INTERVAL:
+            return True                        # diversity floor — find a new hole
+        top = self._top_pool_winrate()
+        return top is not None and top < EXPLOITER_TRIGGER_WR
+
     def _exploiter_phase_done(self):
         """AlphaStar-style adaptive stop: winrate gate + sharpen tail + timeout."""
         if self.phase_eps >= EXPLOITER_MAX_EPISODES:
@@ -369,7 +416,7 @@ class MPPPOTrainer:
         self.exp_agent = None
         self.frozen_main = None
         self.phase = "main"
-        self.next_exploiter_at += EXPLOITER_INTERVAL
+        self.last_exploiter_ep = self.main_ep_total   # spacing counts from here
         self._reset_collection()
 
     # --- PPO update (same construction as the single-process trainer) --------------
@@ -451,7 +498,7 @@ class MPPPOTrainer:
             # NOT saved (dropped on load; the phase restarts when due).
             "league": {
                 "mainEpTotal": self.main_ep_total,
-                "nextExploiterAt": self.next_exploiter_at,
+                "lastExploiterEp": self.last_exploiter_ep,
                 "exploiters": [
                     {"episode": it["episode"], "winrate": it["winrate"],
                      "weights": it["net"].to_records()}
@@ -488,9 +535,9 @@ class MPPPOTrainer:
                                     "winrate": rec.get("winrate", 0.0),
                                     "recent": []})
         self.main_ep_total = league.get("mainEpTotal", self.episode_count)
-        self.next_exploiter_at = league.get(
-            "nextExploiterAt",
-            (self.main_ep_total // EXPLOITER_INTERVAL + 1) * EXPLOITER_INTERVAL)
+        # Default: treat load as "an exploiter just ended" so the min-spacing
+        # guard applies before the next one (back-compat with old checkpoints).
+        self.last_exploiter_ep = league.get("lastExploiterEp", self.main_ep_total)
         self.phase = "main"
         self.exp_agent = None
         self.frozen_main = None
@@ -503,23 +550,27 @@ def main():
     ap.add_argument("--load")
     ap.add_argument("--out", default=str(REPO / "runs/ppo-mp"))
     ap.add_argument("--episodes", type=int, default=100_000_000)
-    ap.add_argument("--save-every", type=int, default=200000)
+    ap.add_argument("--save-every", type=int, default=1_000_000)
     ap.add_argument("--replay-every", type=int, default=20000)
-    ap.add_argument("--workers", type=int, default=8)
-    ap.add_argument("--envs-per-worker", type=int, default=48)
+    ap.add_argument("--workers", type=int, default=10)
+    ap.add_argument("--envs-per-worker", type=int, default=256)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--torch-threads", type=int, default=0,
                     help="cap torch CPU threads (0 = leave default)")
-    ap.add_argument("--exploiter-interval", type=int,
-                    help="override league EXPLOITER_INTERVAL (testing)")
+    ap.add_argument("--exploiter-trigger-wr", type=float,
+                    help="override EXPLOITER_TRIGGER_WR (spawn when top pool wr < this)")
+    ap.add_argument("--exploiter-max-interval", type=int,
+                    help="override EXPLOITER_MAX_INTERVAL (diversity-floor spacing)")
     ap.add_argument("--exploiter-max-episodes", type=int,
                     help="override league EXPLOITER_MAX_EPISODES (testing)")
     args = ap.parse_args()
 
     if args.torch_threads > 0:
         torch.set_num_threads(args.torch_threads)
-    if args.exploiter_interval:
-        globals()["EXPLOITER_INTERVAL"] = args.exploiter_interval
+    if args.exploiter_trigger_wr:
+        globals()["EXPLOITER_TRIGGER_WR"] = args.exploiter_trigger_wr
+    if args.exploiter_max_interval:
+        globals()["EXPLOITER_MAX_INTERVAL"] = args.exploiter_max_interval
     if args.exploiter_max_episodes:
         globals()["EXPLOITER_MAX_EPISODES"] = args.exploiter_max_episodes
 
@@ -575,11 +626,19 @@ def main():
                          else f"EXPL {trainer.phase_eps}/{EXPLOITER_MAX_EPISODES}"
                               f"{'*' if trainer.exp_gate_hit_at is not None else ''}"
                               f" wr {trainer.exp_win_rate()*100:.0f}%")
+                # Pool health: highest opponent winrate vs the main (the signal
+                # that drives new-exploiter spawning), who it is, how many still
+                # beat the main, and episodes since the last exploiter phase.
+                top_wr, top_id, losing = trainer.pool_status()
+                gap = trainer.main_ep_total - trainer.last_exploiter_ep
+                topstr = (f"topWR {top_wr*100:.0f}% ({top_id}) lose {losing} "
+                          f"gap {gap//1000}k" if top_wr is not None
+                          else f"topWR -- gap {gap//1000}k")
                 print(f"ep {trainer.episode_count} [{phase}|"
                       f"snap {len(trainer.snapshots)} exp {len(trainer.exploiters)}] | "
                       f"steps/s {sps:.0f} | "
                       f"ELO {trainer.current_rating:.1f} | "
-                      f"wr {trainer.win_rate()*100:.0f}% | "
+                      f"wr {trainer.win_rate()*100:.0f}% | {topstr} | "
                       f"updates {trainer._active_agent().updates} | {loss} | "
                       f"perf/cycle wait={(p['wait']-last_perf['wait'])/dc*1000:.2f} "
                       f"infer={(p['infer']-last_perf['infer'])/dc*1000:.2f}ms "

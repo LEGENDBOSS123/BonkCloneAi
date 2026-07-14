@@ -1,9 +1,8 @@
-// play2.mjs — paste-into-the-tab AI player for the rl2 / PyTorch checkpoints
-// (python -m bonk.train_ppo / train_ppo_mp / train). Prompts for the checkpoint
-// JSON, rebuilds the policy net with TensorFlow.js, reads live bonk.io state,
-// and drives your player.
+// play3.mjs — paste-into-the-tab AI player for bonk2 (v2) checkpoints
+// (python -m bonk2.train). Prompts for the checkpoint JSON, rebuilds the actor
+// with TensorFlow.js, reads live bonk.io state, and drives your player.
 //
-// REQUIREMENTS (same as play.mjs)
+// REQUIREMENTS (same as play2.mjs)
 //   1. The bonk.io instrumentation from Bonk1v1Ai must already be injected:
 //      top.playerids, top.myid, top.scale, top.presskeys, top.MAKE_KEYS,
 //      top.GET_KEYS, top.RECIEVEFUNCTION (and ideally top.getCurrentFrame).
@@ -11,16 +10,18 @@
 //   3. Paste AFTER the instrumentation; pick the checkpoint in the file dialog.
 //      Stop with top.bonkai.playStop().
 //
-// Works with BOTH algorithms: PPO saves (agent.actor) and NFSP saves
-// (agent.avg — the deployable average policy). Auto-detected.
-//
-// OBSERVATION must match python/bonk/env2.py (and src/rl2/lag_env.mjs), 30 dims:
-//   [ 0- 9] self : x,y,vx,vy (normalized), heavyValue, up,down,left,right,heavy
-//   [10-19] opp  : same, with the opponent's APPLIED keys
-//   [20-23] rel  : dx,dy,dvx,dvy (normalized)
-//   [24-28] pend : the keys WE LAST SENT (may not have applied yet — real lag!)
-//   [29]    time : ticks since round start / MAX_EPISODE_STEPS
+// OBSERVATION must match python/bonk2/env.py, 34 dims:
+//   [ 0-11] self : x,y,vx,vy, heavyValue(masked), up,down,left,right,heavy,
+//                  lastHeavySeen, ticksSinceSeen/200 (cap 1)
+//   [12-23] opp  : same, with the opponent's APPLIED keys
+//   [24-27] rel  : dx,dy,dvx,dvy (normalized)
+//   [28-32] pend : the keys WE LAST SENT (may not have applied yet — real lag!)
+//   [33]    time : ticks since round start / MAX_EPISODE_STEPS
 // Policy outputs 18 logits over joint actions: index = lr*6 + ud*2 + heavy.
+//
+// v2 heavy tracker: the heavy meter is only readable (sprite alpha) while the
+// key is held; it regenerates unseen at 5/tick otherwise. We remember, per
+// player, the last value seen and when — exactly what training saw.
 
 (function () {
     "use strict";
@@ -30,23 +31,22 @@
     const PPM = 15;                    // map1.json physics.ppm
     const ORIGIN_X = 365, ORIGIN_Y = 250; // live map-coords of the map center
     // bonk's playerData2.xvel is a finite difference in position-units per
-    // MILLISECOND (the instrumentation divides by performance.now() deltas), so
-    // m/s = xvel * 1000 / (top.scale * PPM). 900 was the old empirical value —
-    // fall back to it if movement reads look off.
+    // MILLISECOND, so m/s = xvel * 1000 / (top.scale * PPM).
     const VEL_TIME = 1000;
     top.VEL_TIME = VEL_TIME;
 
-    // ===== rl2 env constants (python/bonk/config.py) ==========================
+    // ===== bonk2 env constants (python/bonk2/config.py — keep in sync!) ======
     const POS_SCALE = 1 / 30;
     const VEL_SCALE = 1 / 30;
-    const MAX_EPISODE_STEPS = 2500;    // draw-clock horizon (ticks)
-    const ACTION_REPEAT = 4;           // decide every 4 frames, hold between
+    const MAX_EPISODE_STEPS = 8000;    // draw-clock horizon (ticks)
+    const ACTION_REPEAT = 2;           // decide every 2 frames, hold between
+    const HEAVY_SEEN_TICKS_NORM = 200; // full-regen span (5/tick from 0)
+    const STATE_DIM = 34;
     const TPS = 30;
     const DECIDE_MS = (1000 / TPS) * ACTION_REPEAT;
     const GREEDY = true;               // argmax (set false to sample the policy)
 
-    // Heavy charge: bonk sprite alpha in [0,1]; our obs heavyValue is
-    // heavyPower/1000 = exactly that alpha.
+    // Heavy charge: bonk sprite alpha in [0,1] == heavyPower/1000.
     const HEAVY_CHILD = 2;             // sprite child holding the alpha
     const HEAVY_INVERT = false;        // true if FULL charge reads as alpha 0
 
@@ -67,12 +67,13 @@
 
     // ===== Local state =========================================================
     const keyMap = new Map();          // playerId -> encoded key int (from packets)
+    const heavyTrack = new Map();      // playerId -> { seen: 0..1, seenAtTick }
     let tf = null;
     let policy = null;
     let running = false;
     let lastMove = { left: false, right: false, up: false, down: false, heavy: false, special: false };
     let lastSent = { up: 0, down: 0, left: 0, right: 0, heavy: 0 }; // pending block
-    let roundStartFrame = null;        // for the draw-clock feature
+    let roundStartFrame = null;        // for the draw clock + heavy tracker
     let roundStartMs = 0;
 
     // ===== TensorFlow.js ======================================================
@@ -90,6 +91,7 @@
     // Rebuild the policy exactly like python/bonk/networks.py MLP:
     //   [Dense(no bias) -> LayerNorm(eps 1e-3) -> relu] x hidden -> Dense(+bias)
     // Weight record order: k0, ln0_g, ln0_b, k1, ln1_g, ln1_b, ..., kout, bout.
+    // Architecture is inferred from the shapes, so any hidden size loads.
     function buildPolicy(weights) {
         const kernels = weights.filter((w) => w.shape.length === 2);
         const stateDim = kernels[0].shape[0];
@@ -110,7 +112,7 @@
         model.setWeights(tensors);
         tensors.forEach((t) => t.dispose());
         console.log(`policy built: ${stateDim}->${hidden.join("->")}->${actionDim}`);
-        if (stateDim !== 30) console.warn(`expected obs dim 30, save says ${stateDim} — obs code may be stale`);
+        if (stateDim !== STATE_DIM) console.warn(`expected obs dim ${STATE_DIM}, save says ${stateDim} — v1 model? use play2.mjs for those`);
         return model;
     }
 
@@ -140,24 +142,41 @@
         try { a = top.playerids[id].playerData.children[HEAVY_CHILD].alpha; } catch (_) { a = 0; }
         return HEAVY_INVERT ? 1 - a : a;
     }
-    // The 10-number normalized block for one player (applied keys).
-    function block(id) {
-        const d = top.playerids[id].playerData2;
-        const k = appliedKeys(id);
-        const vs = velScale();
-        const heavyValue = k.heavy ? heavyAlpha(id) : 0; // == heavyPower/1000
-        return [
-            posX(d.px) * POS_SCALE, posY(d.py) * POS_SCALE,
-            d.xvel * vs * VEL_SCALE, d.yvel * vs * VEL_SCALE,
-            heavyValue,
-            k.up ? 1 : 0, k.down ? 1 : 0, k.left ? 1 : 0, k.right ? 1 : 0, k.heavy ? 1 : 0,
-        ];
-    }
     function elapsedTicks() {
         if (typeof top.getCurrentFrame === "function" && roundStartFrame != null) {
             return Math.max(0, top.getCurrentFrame() - roundStartFrame);
         }
         return (performance.now() - roundStartMs) / (1000 / TPS);
+    }
+    // Heavy-meter memory (matches python/bonk2/env.py's tracker): while the
+    // applied heavy key is held the meter is visible — record it; otherwise
+    // report the last sighting and the (normalized) ticks since. Spawn = known
+    // full, so a round starts at { seen: 1, seenAtTick: 0 }.
+    function heavyFeatures(id, heavyHeld) {
+        const now = elapsedTicks();
+        let t = heavyTrack.get(id);
+        if (!t) { t = { seen: 1, seenAtTick: 0 }; heavyTrack.set(id, t); }
+        if (heavyHeld) {
+            t.seen = heavyAlpha(id);
+            t.seenAtTick = now;
+        }
+        const ticksSince = Math.max(0, now - t.seenAtTick);
+        return [t.seen, Math.min(1, ticksSince / HEAVY_SEEN_TICKS_NORM)];
+    }
+    // The 12-number normalized block for one player (applied keys).
+    function block(id) {
+        const d = top.playerids[id].playerData2;
+        const k = appliedKeys(id);
+        const vs = velScale();
+        const heavyValue = k.heavy ? heavyAlpha(id) : 0; // == heavyPower/1000
+        const [seen, sinceNorm] = heavyFeatures(id, !!k.heavy);
+        return [
+            posX(d.px) * POS_SCALE, posY(d.py) * POS_SCALE,
+            d.xvel * vs * VEL_SCALE, d.yvel * vs * VEL_SCALE,
+            heavyValue,
+            k.up ? 1 : 0, k.down ? 1 : 0, k.left ? 1 : 0, k.right ? 1 : 0, k.heavy ? 1 : 0,
+            seen, sinceNorm,
+        ];
     }
     function buildObs(meId, oppId) {
         const md = top.playerids[meId].playerData2;
@@ -196,9 +215,9 @@
             const data = JSON.parse(args.slice(2));
             keyMap.set(data[1], data[2].i);
         }
-        if(args.startsWith("42[15,")){
+        if (args.startsWith("42[15,")) {
             top.presskeys(lastMove, { up: false, down: false, left: false, right: false, heavy: false, special: false });
-            for(let i in top.playerids){
+            for (let i in top.playerids) {
                 top.playerids[i].playerData2.alive = false;
             }
         }
@@ -246,19 +265,17 @@
     async function main() {
         const save = await loadFile();
         const agent = save.agent || save;
-        // PPO -> actor; NFSP -> avg (the deployable average policy).
-        const records = agent.actor || agent.avg;
+        const records = agent.actor;   // bonk2 saves are PPO-only
         if (!records || !records.length) {
-            throw new Error(`no actor/avg weights in save (agent keys: ${Object.keys(agent)})`);
+            throw new Error(`no actor weights in save (agent keys: ${Object.keys(agent)})`);
         }
-        const which = agent.actor ? "actor (PPO)" : "avg (NFSP)";
 
         tf = await loadTf();
         await tf.ready();
         policy = buildPolicy(records);
         top.bonkai.policy = policy;
         console.log(
-            `AI loaded [${which}] on tfjs (${tf.getBackend()})` +
+            `AI loaded [bonk2 actor] on tfjs (${tf.getBackend()})` +
             (save.progress ? `, episode ${save.progress.episodeCount}, ELO ${Math.round(save.progress.currentRating)}` : "") +
             `. Deciding every ${ACTION_REPEAT} frames (${GREEDY ? "greedy" : "sampled"}). ` +
             "Stop with top.bonkai.playStop().");
@@ -268,11 +285,12 @@
         while (running) {
             const ids = getIds();
             if (ids) {
-                if (!inRound) { // round just started: reset the draw clock
+                if (!inRound) { // round just started: reset draw clock + trackers
                     inRound = true;
                     roundStartMs = performance.now();
                     roundStartFrame = typeof top.getCurrentFrame === "function"
                         ? top.getCurrentFrame() : null;
+                    heavyTrack.clear(); // spawn = heavy known full
                 }
                 const [me, opp] = ids;
                 let actionIndex = 0;
@@ -287,7 +305,7 @@
                 top.presskeys(lastMove, { up: false, down: false, left: false, right: false, heavy: false, special: false });
                 lastMove = { left: false, right: false, up: false, down: false, heavy: false, special: false };
                 lastSent = { up: 0, down: 0, left: 0, right: 0, heavy: 0 };
-                
+                heavyTrack.clear();
             }
             await sleep(DECIDE_MS);
         }
@@ -297,5 +315,5 @@
     top.bonkai.playStop = () => { running = false; };
     top.bonkai.playRestart = () => { if (!running) main().catch((e) => console.error(e)); };
 
-    main().catch((e) => console.error("play2.mjs failed:", e));
+    main().catch((e) => console.error("play3.mjs failed:", e));
 })();

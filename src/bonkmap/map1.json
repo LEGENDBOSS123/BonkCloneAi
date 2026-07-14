@@ -11,523 +11,27 @@
         "shapes": [
             {
                 "type": "bx",
-                "w": 9999,
-                "h": 9999,
-                "c": [
-                    0,
-                    0
-                ],
-                "a": 0,
-                "sk": false
-            },
-            {
-                "type": "bx",
-                "w": 9999,
-                "h": 1970,
-                "c": [
-                    0,
-                    1220
-                ],
-                "a": 0,
-                "sk": false
-            },
-            {
-                "type": "bx",
-                "w": 9999,
+                "w": 260,
                 "h": 20,
                 "c": [
                     0,
-                    230
-                ],
-                "a": 0,
-                "sk": false
-            },
-            {
-                "type": "ci",
-                "r": 102,
-                "c": [
-                    0,
-                    0
-                ],
-                "sk": false
-            },
-            {
-                "type": "ci",
-                "r": 100,
-                "c": [
-                    0,
-                    0
-                ],
-                "sk": false
-            },
-            {
-                "type": "bx",
-                "w": 100,
-                "h": 100,
-                "c": [
-                    0,
                     0
                 ],
                 "a": 0,
                 "sk": false
-            },
-            {
-                "type": "ci",
-                "r": 50,
-                "c": [
-                    50,
-                    0
-                ],
-                "sk": false
-            },
-            {
-                "type": "ci",
-                "r": 50,
-                "c": [
-                    -50,
-                    0
-                ],
-                "sk": false
-            },
-            {
-                "type": "bx",
-                "w": 40,
-                "h": 40,
-                "c": [
-                    50,
-                    0
-                ],
-                "a": 0,
-                "sk": false
-            },
-            {
-                "type": "bx",
-                "w": 40,
-                "h": 40,
-                "c": [
-                    -50,
-                    0
-                ],
-                "a": 0,
-                "sk": false
-            },
-            {
-                "type": "ci",
-                "r": 20,
-                "c": [
-                    -50,
-                    -20
-                ],
-                "sk": false
-            },
-            {
-                "type": "ci",
-                "r": 20,
-                "c": [
-                    50,
-                    -20
-                ],
-                "sk": false
-            },
-            {
-                "type": "ci",
-                "r": 20,
-                "c": [
-                    50,
-                    20
-                ],
-                "sk": false
-            },
-            {
-                "type": "ci",
-                "r": 20,
-                "c": [
-                    -50,
-                    20
-                ],
-                "sk": false
-            },
-            {
-                "type": "bx",
-                "w": 10,
-                "h": 1950,
-                "c": [
-                    -40,
-                    999
-                ],
-                "a": 0,
-                "sk": false
-            },
-            {
-                "type": "bx",
-                "w": 10,
-                "h": 1950,
-                "c": [
-                    40,
-                    999
-                ],
-                "a": 0,
-                "sk": false
-            },
-            {
-                "type": "bx",
-                "w": 100,
-                "h": 150,
-                "c": [
-                    0,
-                    -50
-                ],
-                "a": 0,
-                "sk": false
-            },
-            {
-                "type": "bx",
-                "w": 150,
-                "h": 1020,
-                "c": [
-                    0,
-                    340
-                ],
-                "a": 0,
-                "sk": false
-            },
-            {
-                "type": "bx",
-                "w": 150,
-                "h": 1020,
-                "c": [
-                    0,
-                    340
-                ],
-                "a": 0,
-                "sk": false
-            },
-            {
-                "type": "ci",
-                "r": 10,
-                "c": [
-                    -75,
-                    0
-                ],
-                "sk": false
-            },
-            {
-                "type": "ci",
-                "r": 10,
-                "c": [
-                    75,
-                    0
-                ],
-                "sk": false
-            },
-            {
-                "type": "po",
-                "v": [
-                    [
-                        -275,
-                        75
-                    ],
-                    [
-                        -225,
-                        75
-                    ],
-                    [
-                        -275,
-                        150
-                    ]
-                ],
-                "s": 1,
-                "a": 0,
-                "c": [
-                    0,
-                    -15
-                ]
             }
         ],
         "fixtures": [
             {
                 "sh": 0,
-                "n": "",
+                "n": "Unnamed Shape",
                 "fr": null,
                 "fp": null,
                 "re": null,
                 "de": null,
-                "f": 3092271,
-                "d": false,
-                "np": true,
-                "ng": false,
-                "ig": false
-            },
-            {
-                "sh": 1,
-                "n": "",
-                "fr": null,
-                "fp": null,
-                "re": null,
-                "de": null,
-                "f": 2631720,
-                "d": false,
-                "np": true,
-                "ng": false,
-                "ig": false
-            },
-            {
-                "sh": 2,
-                "n": "",
-                "fr": null,
-                "fp": null,
-                "re": null,
-                "de": null,
-                "f": 2894892,
-                "d": false,
-                "np": true,
-                "ng": false,
-                "ig": false
-            },
-            {
-                "sh": 3,
-                "n": "",
-                "fr": null,
-                "fp": null,
-                "re": null,
-                "de": null,
-                "f": 2631720,
-                "d": false,
-                "np": true,
-                "ng": false,
-                "ig": false
-            },
-            {
-                "sh": 4,
-                "n": "",
-                "fr": null,
-                "fp": null,
-                "re": null,
-                "de": null,
-                "f": 3092271,
-                "d": false,
-                "np": true,
-                "ng": false,
-                "ig": false
-            },
-            {
-                "sh": 5,
-                "n": "",
-                "fr": null,
-                "fp": null,
-                "re": null,
-                "de": null,
-                "f": 2631720,
-                "d": false,
-                "np": true,
-                "ng": false,
-                "ig": false
-            },
-            {
-                "sh": 6,
-                "n": "",
-                "fr": null,
-                "fp": null,
-                "re": null,
-                "de": null,
-                "f": 2631720,
-                "d": false,
-                "np": true,
-                "ng": false,
-                "ig": false
-            },
-            {
-                "sh": 7,
-                "n": "",
-                "fr": null,
-                "fp": null,
-                "re": null,
-                "de": null,
-                "f": 2631720,
-                "d": false,
-                "np": true,
-                "ng": false,
-                "ig": false
-            },
-            {
-                "sh": 8,
-                "n": "",
-                "fr": null,
-                "fp": null,
-                "re": null,
-                "de": null,
-                "f": 3092271,
-                "d": false,
-                "np": true,
-                "ng": false,
-                "ig": false
-            },
-            {
-                "sh": 9,
-                "n": "",
-                "fr": null,
-                "fp": null,
-                "re": null,
-                "de": null,
-                "f": 3092271,
-                "d": false,
-                "np": true,
-                "ng": false,
-                "ig": false
-            },
-            {
-                "sh": 10,
-                "n": "",
-                "fr": null,
-                "fp": null,
-                "re": null,
-                "de": null,
-                "f": 3092271,
-                "d": false,
-                "np": true,
-                "ng": false,
-                "ig": false
-            },
-            {
-                "sh": 11,
-                "n": "",
-                "fr": null,
-                "fp": null,
-                "re": null,
-                "de": null,
-                "f": 3092271,
-                "d": false,
-                "np": true,
-                "ng": false,
-                "ig": false
-            },
-            {
-                "sh": 12,
-                "n": "",
-                "fr": null,
-                "fp": null,
-                "re": null,
-                "de": null,
-                "f": 3092271,
-                "d": false,
-                "np": true,
-                "ng": false,
-                "ig": false
-            },
-            {
-                "sh": 13,
-                "n": "",
-                "fr": null,
-                "fp": null,
-                "re": null,
-                "de": null,
-                "f": 3092271,
-                "d": false,
-                "np": true,
-                "ng": false,
-                "ig": false
-            },
-            {
-                "sh": 14,
-                "n": "",
-                "fr": null,
-                "fp": null,
-                "re": null,
-                "de": null,
-                "f": 4538419,
-                "d": false,
-                "np": true,
-                "ng": false,
-                "ig": false
-            },
-            {
-                "sh": 15,
-                "n": "",
-                "fr": null,
-                "fp": null,
-                "re": null,
-                "de": null,
-                "f": 4538419,
-                "d": false,
-                "np": true,
-                "ng": false,
-                "ig": false
-            },
-            {
-                "sh": 16,
-                "n": "",
-                "fr": null,
-                "fp": null,
-                "re": null,
-                "de": null,
-                "f": 6974058,
+                "f": 6929014,
                 "d": false,
                 "np": false,
-                "ng": false,
-                "ig": false
-            },
-            {
-                "sh": 17,
-                "n": "",
-                "fr": null,
-                "fp": null,
-                "re": null,
-                "de": null,
-                "f": 6974058,
-                "d": false,
-                "np": false,
-                "ng": false,
-                "ig": false
-            },
-            {
-                "sh": 18,
-                "n": "",
-                "fr": null,
-                "fp": null,
-                "re": null,
-                "de": null,
-                "f": 6974058,
-                "d": false,
-                "np": false,
-                "ng": false,
-                "ig": false
-            },
-            {
-                "sh": 19,
-                "n": "bounce ball",
-                "fr": null,
-                "fp": null,
-                "re": 2,
-                "de": null,
-                "f": 6974058,
-                "d": false,
-                "np": false,
-                "ng": false,
-                "ig": false
-            },
-            {
-                "sh": 20,
-                "n": "bounce ball",
-                "fr": null,
-                "fp": null,
-                "re": 2,
-                "de": null,
-                "f": 6974058,
-                "d": false,
-                "np": false,
-                "ng": false,
-                "ig": false
-            },
-            {
-                "sh": 21,
-                "n": "L shine",
-                "fr": null,
-                "fp": null,
-                "re": null,
-                "de": null,
-                "f": 9342606,
-                "d": false,
-                "np": true,
                 "ng": false,
                 "ig": false
             }
@@ -535,7 +39,7 @@
         "bodies": [
             {
                 "type": "s",
-                "n": "Insperation",
+                "n": "1v1 Platform",
                 "p": [
                     0,
                     0
@@ -543,7 +47,7 @@
                 "a": 0,
                 "fric": 0.5,
                 "fricp": false,
-                "re": 0.8,
+                "re": -1,
                 "de": 0.3,
                 "lv": [
                     0,
@@ -561,211 +65,7 @@
                     "ct": 0
                 },
                 "fx": [
-                    0,
-                    1,
-                    2
-                ],
-                "f_c": 1,
-                "f_p": true,
-                "f_1": true,
-                "f_2": true,
-                "f_3": true,
-                "f_4": true,
-                "fz": {
-                    "on": false,
-                    "x": 0,
-                    "y": 0,
-                    "d": true,
-                    "p": true,
-                    "a": true,
-                    "t": 0,
-                    "cf": 0
-                }
-            },
-            {
-                "type": "s",
-                "n": "But Take ",
-                "p": [
-                    0,
-                    -140
-                ],
-                "a": 0,
-                "fric": 0.5,
-                "fricp": false,
-                "re": 0.8,
-                "de": 0.3,
-                "lv": [
-                    0,
                     0
-                ],
-                "av": 0,
-                "ld": 0,
-                "ad": 0,
-                "fr": false,
-                "bu": false,
-                "cf": {
-                    "x": 0,
-                    "y": 0,
-                    "w": true,
-                    "ct": 0
-                },
-                "fx": [
-                    3,
-                    4,
-                    5,
-                    6,
-                    7,
-                    8,
-                    9,
-                    10,
-                    11,
-                    12,
-                    13
-                ],
-                "f_c": 1,
-                "f_p": true,
-                "f_1": true,
-                "f_2": true,
-                "f_3": true,
-                "f_4": true,
-                "fz": {
-                    "on": false,
-                    "x": 0,
-                    "y": 0,
-                    "d": true,
-                    "p": true,
-                    "a": true,
-                    "t": 0,
-                    "cf": 0
-                }
-            },
-            {
-                "type": "s",
-                "n": "This Map",
-                "p": [
-                    0,
-                    90
-                ],
-                "a": 0,
-                "fric": 0.5,
-                "fricp": false,
-                "re": -1,
-                "de": 9999,
-                "lv": [
-                    0,
-                    0
-                ],
-                "av": 0,
-                "ld": 0,
-                "ad": 0,
-                "fr": false,
-                "bu": false,
-                "cf": {
-                    "x": 0,
-                    "y": 0,
-                    "w": true,
-                    "ct": 0
-                },
-                "fx": [
-                    14,
-                    15,
-                    16
-                ],
-                "f_c": 1,
-                "f_p": true,
-                "f_1": true,
-                "f_2": true,
-                "f_3": true,
-                "f_4": true,
-                "fz": {
-                    "on": false,
-                    "x": 0,
-                    "y": 0,
-                    "d": true,
-                    "p": true,
-                    "a": true,
-                    "t": 0,
-                    "cf": 0
-                }
-            },
-            {
-                "type": "s",
-                "n": "Copy",
-                "p": [
-                    -255,
-                    200
-                ],
-                "a": 0,
-                "fric": 0.5,
-                "fricp": false,
-                "re": -1,
-                "de": 0.11,
-                "lv": [
-                    0,
-                    0
-                ],
-                "av": 0,
-                "ld": 0,
-                "ad": 0,
-                "fr": false,
-                "bu": false,
-                "cf": {
-                    "x": 0,
-                    "y": 0,
-                    "w": true,
-                    "ct": 0
-                },
-                "fx": [
-                    17,
-                    20
-                ],
-                "f_c": 1,
-                "f_p": true,
-                "f_1": true,
-                "f_2": true,
-                "f_3": true,
-                "f_4": true,
-                "fz": {
-                    "on": false,
-                    "x": 0,
-                    "y": 0,
-                    "d": true,
-                    "p": true,
-                    "a": true,
-                    "t": 0,
-                    "cf": 0
-                }
-            },
-            {
-                "type": "s",
-                "n": " Hey Please Don't,",
-                "p": [
-                    255,
-                    200
-                ],
-                "a": 0,
-                "fric": 0.5,
-                "fricp": false,
-                "re": -1,
-                "de": 0.11,
-                "lv": [
-                    0,
-                    0
-                ],
-                "av": 0,
-                "ld": 0,
-                "ad": 0,
-                "fr": false,
-                "bu": false,
-                "cf": {
-                    "x": 0,
-                    "y": 0,
-                    "w": true,
-                    "ct": 0
-                },
-                "fx": [
-                    18,
-                    19
                 ],
                 "f_c": 1,
                 "f_p": true,
@@ -786,101 +86,45 @@
             }
         ],
         "bro": [
-            4,
-            3,
-            2,
-            1,
             0
         ],
         "joints": [],
-        "ppm": 10
+        "ppm": 15
     },
     "spawns": [
         {
-            "x": 290,
-            "y": 20,
+            "x": -100,
+            "y": -25,
             "xv": 0,
             "yv": 0,
             "priority": 5,
             "r": true,
             "f": true,
-            "b": false,
-            "gr": false,
-            "ye": false,
-            "n": "R2"
-        },
-        {
-            "x": 220,
-            "y": 20,
-            "xv": 0,
-            "yv": 0,
-            "priority": 8,
-            "r": true,
-            "f": true,
-            "b": false,
-            "gr": false,
-            "ye": false,
-            "n": "R1"
-        },
-        {
-            "x": -220,
-            "y": 20,
-            "xv": 0,
-            "yv": 0,
-            "priority": 10,
-            "r": false,
-            "f": true,
             "b": true,
             "gr": false,
             "ye": false,
-            "n": "b1"
+            "n": "Spawn"
         },
         {
-            "x": 0,
-            "y": -80,
-            "xv": 0,
-            "yv": 0,
-            "priority": 1,
-            "r": false,
-            "f": true,
-            "b": true,
-            "gr": false,
-            "ye": false,
-            "n": "b3"
-        },
-        {
-            "x": 0,
-            "y": -50,
-            "xv": 0,
-            "yv": 0,
-            "priority": 1,
-            "r": true,
-            "f": true,
-            "b": false,
-            "gr": false,
-            "ye": false,
-            "n": "r3"
-        },
-        {
-            "x": -290,
-            "y": 20,
+            "x": 100,
+            "y": -25,
             "xv": 0,
             "yv": 0,
             "priority": 5,
-            "r": false,
+            "r": true,
             "f": true,
             "b": true,
             "gr": false,
             "ye": false,
-            "n": "b2"
+            "n": "Spawn"
         }
     ],
     "capZones": [],
     "m": {
-        "a": "billioninjoe",
-        "n": "Gang Grounds 2.0",
+        "a": "GudStrat",
+        "n": "Simple 1v1",
         "dbv": 2,
-        "dbid": 37368,
+        "dbid": 123,
         "authid": -1,
         "date": "",
         "rxid": 0,
@@ -888,11 +132,11 @@
         "rxa": "",
         "rxdb": 1,
         "cr": [
-            "billioninjoe"
+            "GudStrat"
         ],
         "pub": false,
         "mo": "",
-        "vu": 56516,
-        "vd": 10421
+        "vu": 75281,
+        "vd": 15619
     }
 }

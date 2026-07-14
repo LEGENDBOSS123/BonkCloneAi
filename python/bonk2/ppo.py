@@ -1,40 +1,38 @@
-"""PPO agent (PyTorch) over the joint 18-action space — the rl1 algorithm
-(clipped surrogate, GAE, separate actor/critic with LayerNorm, mirror augment)
-on the rl2 observation/action interface, so checkpoints slot into the same
-tooling (play.py --net actor, future play2.mjs).
-
-Policy is categorical over 18 joint actions (softmax), not 5 Bernoullis:
-cleaner math, no contradictory key combos, and matches the NFSP nets.
+"""bonk2 PPO: clipped surrogate + GAE, categorical over the 18 joint actions,
+separate actor/critic MLPs with LayerNorm (tfjs-compatible records, so actors
+deploy straight into play3.mjs). All hyperparameters live in bonk2.config.
 """
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .networks import MLP
+from bonk.networks import MLP
 
-HIDDEN = [256, 256]
-ACTOR_LR = 2.5e-4
-CRITIC_LR = 3e-4
-CLIP_EPS = 0.2
-EPOCHS = 4
-MINIBATCH = 4_096
-# Entropy coefficient anneals linearly from START to END over the first
-# ENTROPY_DECAY_EPISODES episodes, then holds at END: explore hard while
-# self-play is still discovering strategies, sharpen for the rest of the run.
-ENTROPY_COEF_START = 0.2
-ENTROPY_COEF_END = 0.01
-ENTROPY_DECAY_EPISODES = 2_500_000
-VALUE_COEF = 0.5
-MAX_GRAD_NORM = 0.5
-NORMALIZE_ADV = True
-CLIP_VALUE_LOSS = True
+from . import config as C
 
 
 def entropy_coef_at(episode: int) -> float:
     """Linear anneal START -> END over ENTROPY_DECAY_EPISODES, then flat."""
-    frac = min(1.0, episode / ENTROPY_DECAY_EPISODES)
-    return ENTROPY_COEF_START + (ENTROPY_COEF_END - ENTROPY_COEF_START) * frac
+    frac = min(1.0, episode / C.ENTROPY_DECAY_EPISODES)
+    return C.ENTROPY_COEF_START + (C.ENTROPY_COEF_END - C.ENTROPY_COEF_START) * frac
+
+
+def compute_gae(rewards, values, dones, last_value):
+    """GAE(gamma, lambda) over one stream; last_value bootstraps a cut-off
+    (non-terminal) tail."""
+    n = len(rewards)
+    adv = np.zeros(n, dtype=np.float32)
+    ret = np.zeros(n, dtype=np.float32)
+    gae = 0.0
+    for t in range(n - 1, -1, -1):
+        nonterminal = 1.0 - dones[t]
+        next_v = last_value if t == n - 1 else values[t + 1]
+        delta = rewards[t] + C.GAMMA * next_v * nonterminal - values[t]
+        gae = delta + C.GAMMA * C.GAE_LAMBDA * nonterminal * gae
+        adv[t] = gae
+        ret[t] = gae + values[t]
+    return adv, ret
 
 
 class PPOAgent:
@@ -42,14 +40,14 @@ class PPOAgent:
         self.state_dim = state_dim
         self.num_actions = num_actions
         self.device = torch.device(device)
-        self.actor = MLP(state_dim, HIDDEN, num_actions).to(self.device)
-        self.critic = MLP(state_dim, HIDDEN, 1).to(self.device)
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=ACTOR_LR)
-        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=CRITIC_LR)
+        self.actor = MLP(state_dim, C.HIDDEN, num_actions).to(self.device)
+        self.critic = MLP(state_dim, C.HIDDEN, 1).to(self.device)
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=C.ACTOR_LR)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=C.CRITIC_LR)
         self.updates = 0
         self.stats = {"actor_loss": 0.0, "critic_loss": 0.0, "entropy": 0.0}
 
-    # --- acting -----------------------------------------------------------------
+    # ── acting ─────────────────────────────────────────────────────────────────
     @torch.no_grad()
     def act_batch(self, states: np.ndarray):
         """Sample actions for the learner: returns (actions, logps, values)."""
@@ -63,18 +61,20 @@ class PPOAgent:
 
     @torch.no_grad()
     def act_actions(self, net, states: np.ndarray, greedy: bool = False):
-        """Actions only, from an arbitrary actor (snapshot opponents)."""
-        x = torch.from_numpy(np.ascontiguousarray(states)).to(self.device)
+        """Actions only, from an arbitrary frozen actor (pool opponents).
+        Runs on the NET's device — pool nets stay on CPU even when the agent
+        trains on GPU (many small batches lose to dispatch overhead there)."""
+        x = torch.from_numpy(np.ascontiguousarray(states)).to(
+            next(net.parameters()).device)
         logits = net(x)
         if greedy:
             return logits.argmax(dim=1).cpu().numpy()
         return torch.multinomial(F.softmax(logits, dim=1), 1).squeeze(1).cpu().numpy()
 
-    # --- PPO update ---------------------------------------------------------------
-    def update(self, rollout: dict, entropy_coef: float = ENTROPY_COEF_END):
+    # ── PPO update ─────────────────────────────────────────────────────────────
+    def update(self, rollout: dict, entropy_coef: float = C.ENTROPY_COEF_END):
         """rollout: numpy arrays states [N,D], actions [N], logps [N],
-        values [N], advantages [N], returns [N]. `entropy_coef` comes from the
-        trainer's schedule (entropy_coef_at)."""
+        values [N], advantages [N], returns [N]."""
         dev = self.device
         states = torch.from_numpy(rollout["states"]).to(dev)
         actions = torch.from_numpy(rollout["actions"]).to(dev)
@@ -82,15 +82,15 @@ class PPOAgent:
         old_v = torch.from_numpy(rollout["values"]).to(dev)
         returns = torch.from_numpy(rollout["returns"]).to(dev)
         adv = torch.from_numpy(rollout["advantages"]).to(dev)
-        if NORMALIZE_ADV:
+        if C.NORMALIZE_ADV:
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
         n = states.shape[0]
         a_losses, c_losses, ents = [], [], []
-        for _ in range(EPOCHS):
+        for _ in range(C.EPOCHS):
             perm = torch.randperm(n, device=dev)
-            for s in range(0, n, MINIBATCH):
-                idx = perm[s:s + MINIBATCH]
+            for s in range(0, n, C.MINIBATCH):
+                idx = perm[s:s + C.MINIBATCH]
                 mb_s = states[idx]
 
                 logits = self.actor(mb_s)
@@ -98,25 +98,28 @@ class PPOAgent:
                 logp = logp_all.gather(1, actions[idx].unsqueeze(1)).squeeze(1)
                 ratio = (logp - old_logp[idx]).exp()
                 s1 = ratio * adv[idx]
-                s2 = ratio.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * adv[idx]
+                s2 = ratio.clamp(1 - C.CLIP_EPS, 1 + C.CLIP_EPS) * adv[idx]
                 entropy = -(logp_all.exp() * logp_all).sum(dim=1).mean()
                 actor_loss = -torch.min(s1, s2).mean() - entropy_coef * entropy
                 self.actor_opt.zero_grad(set_to_none=True)
                 actor_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), MAX_GRAD_NORM)
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(),
+                                               C.MAX_GRAD_NORM)
                 self.actor_opt.step()
 
                 v = self.critic(mb_s).squeeze(1)
-                if CLIP_VALUE_LOSS:
-                    v_clip = old_v[idx] + (v - old_v[idx]).clamp(-CLIP_EPS, CLIP_EPS)
+                if C.CLIP_VALUE_LOSS:
+                    v_clip = old_v[idx] + (v - old_v[idx]).clamp(-C.CLIP_EPS,
+                                                                 C.CLIP_EPS)
                     critic_loss = torch.max((v - returns[idx]) ** 2,
                                             (v_clip - returns[idx]) ** 2).mean()
                 else:
                     critic_loss = F.mse_loss(v, returns[idx])
-                critic_loss = VALUE_COEF * critic_loss
+                critic_loss = C.VALUE_COEF * critic_loss
                 self.critic_opt.zero_grad(set_to_none=True)
                 critic_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), MAX_GRAD_NORM)
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(),
+                                               C.MAX_GRAD_NORM)
                 self.critic_opt.step()
 
                 a_losses.append(float(actor_loss.detach()))
@@ -132,7 +135,7 @@ class PPOAgent:
         }
         return self.stats
 
-    # --- save / load (rl2-style JSON; actor records feed play2.mjs later) -----------
+    # ── save / load (actor records feed play3.mjs) ─────────────────────────────
     def serialize(self) -> dict:
         return {
             "actor": self.actor.to_records(),

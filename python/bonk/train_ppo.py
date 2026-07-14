@@ -30,14 +30,14 @@ from .trainer import elo_update, mirror_action, mirror_obs
 
 REPO = Path(__file__).resolve().parents[2]
 
-NUM_ENVS = 48
+NUM_ENVS = 256
 TOTAL_EPISODES = 500_000
-GAMMA = 0.997          # per decision (ACTION_REPEAT ticks)
+GAMMA = 0.99          # per decision (ACTION_REPEAT ticks)
 GAE_LAMBDA = 0.95
-ROLLOUT_STEPS = 16_384   # learner decisions per PPO update
+ROLLOUT_STEPS = 32_768   # learner decisions per PPO update
 MIRROR_AUGMENT = True
 OPPONENT_CURRENT_PROB = 0.5
-SNAPSHOT_INTERVAL = 80000  # episodes
+SNAPSHOT_INTERVAL = 200_000  # episodes
 SNAPSHOT_BUFFER = 50
 INITIAL_RATING = 1000.0
 

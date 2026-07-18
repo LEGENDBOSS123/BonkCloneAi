@@ -76,16 +76,23 @@ class PPOAgent:
         """rollout: numpy arrays states [N,D], actions [N], logps [N],
         values [N], advantages [N], returns [N]."""
         dev = self.device
-        states = torch.from_numpy(rollout["states"]).to(dev)
-        actions = torch.from_numpy(rollout["actions"]).to(dev)
-        old_logp = torch.from_numpy(rollout["logps"]).to(dev)
-        old_v = torch.from_numpy(rollout["values"]).to(dev)
-        returns = torch.from_numpy(rollout["returns"]).to(dev)
-        adv = torch.from_numpy(rollout["advantages"]).to(dev)
+        # Trim to a multiple of 2048 rows: torch-MPS caches a compiled graph
+        # per tensor shape forever, so a different row count every update
+        # (variable opponent-stream size) leaks memory without bound. Trimming
+        # bounds the shape set; the dropped tail is <2% of random rows.
+        n = rollout["states"].shape[0]
+        n -= n % 2048
+        states = torch.from_numpy(rollout["states"][:n]).to(dev)
+        actions = torch.from_numpy(rollout["actions"][:n]).to(dev)
+        old_logp = torch.from_numpy(rollout["logps"][:n]).to(dev)
+        old_v = torch.from_numpy(rollout["values"][:n]).to(dev)
+        returns = torch.from_numpy(rollout["returns"][:n]).to(dev)
+        adv_np = rollout["advantages"][:n]
         if C.NORMALIZE_ADV:
-            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-
-        n = states.shape[0]
+            # Normalize in numpy: a variable-length reduction on MPS would be
+            # one more per-shape graph in the never-evicted cache.
+            adv_np = (adv_np - adv_np.mean()) / (adv_np.std() + 1e-8)
+        adv = torch.from_numpy(np.ascontiguousarray(adv_np)).to(dev)
         a_losses, c_losses, ents = [], [], []
         for _ in range(C.EPOCHS):
             perm = torch.randperm(n, device=dev)

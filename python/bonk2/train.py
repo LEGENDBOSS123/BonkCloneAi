@@ -29,7 +29,7 @@ from . import config as C
 from .collect import VecCollector
 from .env import mirror_action_batch, mirror_obs_batch
 from .league import League
-from .ppo import PPOAgent, compute_gae, entropy_coef_at
+from .ppo import PPOAgent, entropy_coef_at
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -49,18 +49,44 @@ class Trainer:
         self.recent = []                # main's last 100 scores (any opponent)
         self.perf = {"wait": 0.0, "infer": 0.0, "train": 0.0, "cycles": 0}
 
-        # Per-env collection state. pend_* = [s, a, logp, v, reward].
+        # Rollout buffers. Every env advances one row per cycle (pendings are
+        # completed in lockstep), so streams are flat [T, E] arrays and GAE
+        # vectorizes across all envs — per-env Python lists were the main-
+        # process bottleneck at E≈2560.
+        E, D = self.E, agent.state_dim
+        self.T = C.ROLLOUT_STEPS // E + 3          # capacity (trigger + margin)
+        self.b_s = np.zeros((self.T, E, D), dtype=np.float32)   # learner seat
+        self.b_a = np.zeros((self.T, E), dtype=np.int64)
+        self.b_lp = np.zeros((self.T, E), dtype=np.float32)
+        self.b_v = np.zeros((self.T, E), dtype=np.float32)
+        self.b_r = np.zeros((self.T, E), dtype=np.float32)
+        self.b_d = np.zeros((self.T, E), dtype=np.float32)
+        self.b_os = np.zeros((self.T, E, D), dtype=np.float32)  # opponent seat
+        self.b_oa = np.zeros((self.T, E), dtype=np.int64)       # ("current" envs
+        self.b_olp = np.zeros((self.T, E), dtype=np.float32)    #  only, masked
+        self.b_ov = np.zeros((self.T, E), dtype=np.float32)     #  by b_om)
+        self.b_or = np.zeros((self.T, E), dtype=np.float32)
+        self.b_om = np.zeros((self.T, E), dtype=bool)
+        self.t = 0
+
+        # In-flight decisions (one per env, arrays across E).
+        self.p_valid = False            # no pendings until the first inference
+        self.p_s = np.zeros((E, D), dtype=np.float32)
+        self.p_a = np.zeros(E, dtype=np.int64)
+        self.p_lp = np.zeros(E, dtype=np.float32)
+        self.p_v = np.zeros(E, dtype=np.float32)
+        self.p_r = np.zeros(E, dtype=np.float32)
+        self.po_s = np.zeros((E, D), dtype=np.float32)
+        self.po_a = np.zeros(E, dtype=np.int64)
+        self.po_lp = np.zeros(E, dtype=np.float32)
+        self.po_v = np.zeros(E, dtype=np.float32)
+        self.po_r = np.zeros(E, dtype=np.float32)
+        self.po_m = np.zeros(E, dtype=bool)        # opponent pend validity
+
         self.opp = [None] * self.E      # ("current",None)|("snap",i)|("exp",i)|("frozen",None)
-        self.pend_l = [None] * self.E
-        self.pend_o = [None] * self.E
-        self.stream_l = [self._stream() for _ in range(self.E)]
-        self.stream_o = [None] * self.E
+        self.cur_mask = np.zeros(E, dtype=bool)    # opp[i] is "current"
         for i in range(self.E):
             self._select_opponent(i)
-
-    @staticmethod
-    def _stream():
-        return {"s": [], "a": [], "lp": [], "v": [], "r": [], "d": []}
 
     def _active_agent(self):
         return self.league.exp_agent if self.league.phase == "exploiter" else self.agent
@@ -68,13 +94,12 @@ class Trainer:
     def _select_opponent(self, i):
         if self.league.phase == "exploiter":
             self.opp[i] = ("frozen", None)   # best-respond to the frozen main
-            self.stream_o[i] = None
+            self.cur_mask[i] = False
         else:
             kind, idx = self.league.sample_opponent()
             self.opp[i] = (kind, idx)
             # Mirror match: both seats are the live learner -> both train.
-            self.stream_o[i] = self._stream() if kind == "current" else None
-        self.pend_o[i] = None
+            self.cur_mask[i] = kind == "current"
 
     def _shift_opponent_indices(self, kind):
         """The oldest (kind) pool member was evicted; in-flight opponents keep
@@ -83,18 +108,8 @@ class Trainer:
             if self.opp[j][0] == kind:
                 self.opp[j] = (kind, max(0, self.opp[j][1] - 1))
 
-    @staticmethod
-    def _complete(stream, pend, done):
-        s, a, lp, v, r = pend
-        stream["s"].append(s)
-        stream["a"].append(a)
-        stream["lp"].append(lp)
-        stream["v"].append(v)
-        stream["r"].append(r)
-        stream["d"].append(1.0 if done else 0.0)
-
     def learner_steps(self):
-        return sum(len(s["s"]) for s in self.stream_l)
+        return self.t * self.E
 
     # ── one decision-block cycle ───────────────────────────────────────────────
     def cycle(self):
@@ -103,19 +118,30 @@ class Trainer:
         t1 = time.perf_counter()
         self.env_steps += self.E * self.coll.k
 
-        # 1. Fold the finished block into pendings; close episodes.
-        for i in range(self.E):
-            ended = done[i, 0] > 0
-            if self.pend_l[i] is not None:
-                self.pend_l[i][4] += brew[i, 0]
-                self._complete(self.stream_l[i], self.pend_l[i], ended)
-                self.pend_l[i] = None
-            if self.pend_o[i] is not None:
-                self.pend_o[i][4] += brew[i, 1]
-                self._complete(self.stream_o[i], self.pend_o[i], ended)
-                self.pend_o[i] = None
-            if ended:
-                self._finish_episode(i, done[i])
+        # 1. Fold the finished block into pendings and commit them as row t.
+        ended = done[:, 0] > 0
+        if self.p_valid:
+            t = self.t
+            self.p_r += brew[:, 0]
+            self.b_s[t] = self.p_s
+            self.b_a[t] = self.p_a
+            self.b_lp[t] = self.p_lp
+            self.b_v[t] = self.p_v
+            self.b_r[t] = self.p_r
+            self.b_d[t] = ended
+            self.po_r += brew[:, 1]
+            self.b_os[t] = self.po_s
+            self.b_oa[t] = self.po_a
+            self.b_olp[t] = self.po_lp
+            self.b_ov[t] = self.po_v
+            self.b_or[t] = self.po_r
+            self.b_om[t] = self.po_m
+            self.t = t + 1
+            self.p_valid = False
+        for i in np.nonzero(ended)[0]:
+            self._finish_episode(int(i), done[i])
+            # A phase transition inside this loop resets the buffers; the
+            # remaining ended envs still get their league bookkeeping.
 
         # 2. Batched inference. The learner seat uses the ACTIVE agent (main, or
         #    the exploiter during its phase); opponents route by kind.
@@ -123,19 +149,35 @@ class Trainer:
         actions = np.zeros((self.E, 2), dtype=np.int64)
         # Learner seats + "current" opponent seats share the same net in main
         # phase (and cur is empty in exploiter phase), so run them as ONE batch.
-        cur = [i for i in range(self.E) if self.opp[i][0] == "current"]
+        cur = np.nonzero(self.cur_mask)[0]
         l_states = np.ascontiguousarray(obs[:, 0])
-        both = (np.concatenate([l_states, obs[cur, 1]]) if cur else l_states)
+        both = (np.concatenate([l_states, obs[cur, 1]]) if len(cur) else l_states)
+        # Pad the batch height to a multiple of 512: torch-MPS compiles and
+        # caches a kernel graph PER TENSOR SHAPE and never evicts, so feeding
+        # it a different height every cycle leaks ~MB per new shape (observed
+        # 60 GB footprint over hours). Bucketing keeps the shape set tiny.
+        n_real = both.shape[0]
+        pad = -n_real % 512
+        if pad:
+            both = np.concatenate(
+                [both, np.zeros((pad, both.shape[1]), dtype=np.float32)])
         acts, lps, vals = active.act_batch(both)
+        acts, lps, vals = acts[:n_real], lps[:n_real], vals[:n_real]
         actions[:, 0] = acts[:self.E]
-        for i in range(self.E):
-            self.pend_l[i] = [l_states[i].copy(), int(acts[i]),
-                              float(lps[i]), float(vals[i]), 0.0]
-        for j, i in enumerate(cur):
-            k = self.E + j
-            actions[i, 1] = acts[k]
-            self.pend_o[i] = [both[k].copy(), int(acts[k]),
-                              float(lps[k]), float(vals[k]), 0.0]
+        self.p_s[:] = l_states
+        self.p_a[:] = acts[:self.E]
+        self.p_lp[:] = lps[:self.E]
+        self.p_v[:] = vals[:self.E]
+        self.p_r[:] = 0.0
+        self.po_m[:] = self.cur_mask
+        self.po_r[:] = 0.0
+        if len(cur):
+            actions[cur, 1] = acts[self.E:]
+            self.po_s[cur] = both[self.E:n_real]   # exclude padding rows
+            self.po_a[cur] = acts[self.E:]
+            self.po_lp[cur] = lps[self.E:]
+            self.po_v[cur] = vals[self.E:]
+        self.p_valid = True
         # Frozen opponents grouped so each net does one batched forward.
         groups = {}
         for i in range(self.E):
@@ -145,8 +187,7 @@ class Trainer:
         for (kind, idx), idxs in groups.items():
             net = self.league.opponent_net(kind, idx)
             acts = self.agent.act_actions(net, np.ascontiguousarray(obs[idxs, 1]))
-            for j, i in enumerate(idxs):
-                actions[i, 1] = acts[j]
+            actions[idxs, 1] = acts
 
         self.coll.send_actions(actions)
         t2 = time.perf_counter()
@@ -188,41 +229,69 @@ class Trainer:
             self._select_opponent(i)
 
     def _reset_collection(self):
-        """Phase changed: drop all in-flight streams/pendings (they belong to
-        the old learner) and re-pick every opponent."""
+        """Phase changed: drop all in-flight rows/pendings (they belong to the
+        old learner) and re-pick every opponent."""
+        self.t = 0
+        self.p_valid = False
+        self.po_m[:] = False
         for i in range(self.E):
-            self.pend_l[i] = self.pend_o[i] = None
-            self.stream_l[i] = self._stream()
-            self.stream_o[i] = None
             self._select_opponent(i)
 
     # ── PPO update ─────────────────────────────────────────────────────────────
+    @staticmethod
+    def _gae_columns(r, v, d, last_v):
+        """GAE over [T, E] arrays, vectorized across the E columns."""
+        T = r.shape[0]
+        adv = np.zeros_like(r)
+        gae = np.zeros(r.shape[1], dtype=np.float32)
+        for t in range(T - 1, -1, -1):
+            nt = 1.0 - d[t]
+            next_v = last_v if t == T - 1 else v[t + 1]
+            delta = r[t] + C.GAMMA * next_v * nt - v[t]
+            gae = delta + C.GAMMA * C.GAE_LAMBDA * nt * gae
+            adv[t] = gae
+        return adv, adv + v
+
     def run_update(self):
         t0 = time.perf_counter()
-        S, A, LP, V, ADV, RET = [], [], [], [], [], []
-        for i in range(self.E):
-            for stream, pend in ((self.stream_l[i], self.pend_l[i]),
-                                 (self.stream_o[i], self.pend_o[i])):
-                if stream is None or not stream["s"]:
-                    continue
-                # Bootstrap a cut-off tail with the pending value estimate.
-                last_v = pend[3] if (pend is not None and not stream["d"][-1]) else 0.0
-                adv, ret = compute_gae(stream["r"], stream["v"], stream["d"], last_v)
-                S.append(np.stack(stream["s"]))
-                A.append(np.asarray(stream["a"], dtype=np.int64))
-                LP.append(np.asarray(stream["lp"], dtype=np.float32))
-                V.append(np.asarray(stream["v"], dtype=np.float32))
-                ADV.append(adv)
-                RET.append(ret)
-        states = np.concatenate(S).astype(np.float32)
-        actions = np.concatenate(A)
-        logps, values = np.concatenate(LP), np.concatenate(V)
-        advs, rets = np.concatenate(ADV), np.concatenate(RET)
-        if C.MIRROR_AUGMENT:
+        T, E, D = self.t, self.E, self.agent.state_dim
+
+        # Learner seat: every [t, i] cell is a real transition. Cut-off tails
+        # (d[T-1]=0) bootstrap from the in-flight pending value.
+        last_v = np.where(self.b_d[T - 1] > 0, 0.0, self.p_v).astype(np.float32)
+        adv, ret = self._gae_columns(self.b_r[:T], self.b_v[:T], self.b_d[:T], last_v)
+        states = self.b_s[:T].reshape(T * E, D).copy()
+        actions = self.b_a[:T].reshape(-1).copy()
+        logps = self.b_lp[:T].reshape(-1).copy()
+        values = self.b_v[:T].reshape(-1).copy()
+        advs, rets = adv.reshape(-1), ret.reshape(-1)
+
+        # Opponent seat: only cells where the opponent was "current" (b_om).
+        # Invalid cells produce garbage GAE that never leaks INTO valid cells:
+        # a valid segment always ends with d=1 (opponents change only at
+        # episode end), which zeroes the recursion before the boundary.
+        m = self.b_om[:T]
+        if m.any():
+            last_vo = np.where(self.b_d[T - 1] > 0, 0.0, self.po_v).astype(np.float32)
+            adv_o, ret_o = self._gae_columns(self.b_or[:T], self.b_ov[:T],
+                                             self.b_d[:T], last_vo)
+            sel = m.reshape(-1)
+            states = np.concatenate([states, self.b_os[:T].reshape(T * E, D)[sel]])
+            actions = np.concatenate([actions, self.b_oa[:T].reshape(-1)[sel]])
+            logps = np.concatenate([logps, self.b_olp[:T].reshape(-1)[sel]])
+            values = np.concatenate([values, self.b_ov[:T].reshape(-1)[sel]])
+            advs = np.concatenate([advs, adv_o.reshape(-1)[sel]])
+            rets = np.concatenate([rets, ret_o.reshape(-1)[sel]])
+        if C.MIRROR_MODE == "duplicate":
             states = np.concatenate([states, mirror_obs_batch(states)])
             actions = np.concatenate([actions, mirror_action_batch(actions)])
             logps, values = np.tile(logps, 2), np.tile(values, 2)
             advs, rets = np.tile(advs, 2), np.tile(rets, 2)
+        elif C.MIRROR_MODE == "sample":
+            # Mirror a random half in place: symmetry without doubling rows.
+            mask = np.random.random(len(states)) < 0.5
+            states[mask] = mirror_obs_batch(states[mask])
+            actions[mask] = mirror_action_batch(actions[mask])
         rollout = {
             "states": states,
             "actions": actions,
@@ -236,10 +305,7 @@ class Trainer:
         else:
             ec = entropy_coef_at(self.league.main_ep_total)
         stats = self._active_agent().update(rollout, entropy_coef=ec)
-        for i in range(self.E):
-            self.stream_l[i] = self._stream()
-            if self.stream_o[i] is not None:
-                self.stream_o[i] = self._stream()
+        self.t = 0                      # restart the buffers; pendings stay live
         self.perf["train"] += time.perf_counter() - t0
         return stats, rollout["states"].shape[0]
 
@@ -282,10 +348,10 @@ def main():
     ap.add_argument("--load")
     ap.add_argument("--out", default=str(REPO / "runs/ppo2"))
     ap.add_argument("--episodes", type=int, default=100_000_000)
-    ap.add_argument("--save-every", type=int, default=1_000_000)
+    ap.add_argument("--save-every", type=int, default=400_000)
     ap.add_argument("--replay-every", type=int, default=1_000_000)
-    ap.add_argument("--workers", type=int, default=10)
-    ap.add_argument("--envs-per-worker", type=int, default=256)
+    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--envs-per-worker", type=int, default=320)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--torch-threads", type=int, default=0,
                     help="cap torch CPU threads (0 = leave default)")
@@ -361,9 +427,11 @@ def main():
                               f" wr {lg.exp_win_rate()*100:.0f}%")
                 top_wr, top_id, losing = lg.pool_status()
                 gap = lg.main_ep_total - lg.last_exploiter_ep
-                topstr = (f"topWR {top_wr*100:.0f}% ({top_id}) lose {losing} "
+                exp_top = lg.top_exploiter_winrate()
+                expstr = f"expTop {exp_top*100:.0f}%" if exp_top is not None else "expTop --"
+                topstr = (f"topWR {top_wr*100:.0f}% ({top_id}) {expstr} lose {losing} "
                           f"gap {gap//1000}k" if top_wr is not None
-                          else f"topWR -- gap {gap//1000}k")
+                          else f"topWR -- {expstr} gap {gap//1000}k")
                 print(f"ep {trainer.episode_count} [{phase}|"
                       f"snap {len(lg.snapshots)} exp {len(lg.exploiters)}] | "
                       f"steps/s {sps:.0f} | "
@@ -378,6 +446,9 @@ def main():
             if trainer.episode_count - last_saved >= args.save_every:
                 last_saved = trainer.episode_count
                 save_checkpoint()
+    except Exception:
+        save_checkpoint("-crash")   # never lose progress to a bug
+        raise
     finally:
         coll.stop()
     save_checkpoint("-final")

@@ -1,8 +1,19 @@
-"""bonk2 LagEnv: decision-level env with input lag, joint discrete actions,
-normalized 34-dim observations, and sparse terminal rewards.
+"""bonk2 LagEnv: decision-level env with netcode simulation, joint discrete
+actions, normalized 34-dim observations, and sparse terminal rewards.
 
-Same lag mechanics as v1 (bonk.env2): a decision made at tick t governs physics
-from tick t + lag, with lag randomized per episode as the sim-to-real bridge.
+Netcode (config.NETCODE) — the sim-to-real bridge:
+- "rollback" (what bonk.io actually runs): both seats' inputs apply INSTANTLY
+  to the authoritative sim, but each seat OBSERVES the opponent through a
+  client-side prediction — the opponent's state `lag` ticks ago replayed with
+  held inputs (ballistic extrapolation here; collisions ignored over the short
+  window). The prediction is right while the opponent holds their keys and
+  wrong exactly when they change them — jukes live inside this window. This
+  matches what play3.mjs reads from the live game (rendered predicted position
+  + last-received keys).
+- "delay": legacy v1 model — a decision made at tick t governs physics from
+  tick t + lag for BOTH seats, opponent observed perfectly.
+
+`lag` is randomized per episode (network jitter) in both modes.
 
 v2 obs change — heavy-meter memory. The raw heavyValue is only observable while
 the heavy key is held (masked to 0 otherwise), but the meter silently
@@ -23,9 +34,11 @@ Observation layout (STATE_DIM = 34):
 """
 
 import random
+from collections import deque
 
 import numpy as np
 
+from bonk import config as PC          # physics constants (gravity, heavy rates)
 from bonk.sim import BonkSim, index_to_keys
 
 from . import config as C
@@ -78,6 +91,15 @@ class LagEnv:
         # the applied keys, which both seats can see, so one tracker serves both).
         self.heavy_seen = [1.0, 1.0]        # last observed meter, HEAVY_SCALE'd
         self.heavy_seen_ticks = [0, 0]      # ticks since that observation
+        # Rollback: per-player state history so the opponent view can run
+        # `lag` ticks behind. Snapshot per tick:
+        # (x, y, vx, vy, applied_idx, heavy_power, heavy_seen, heavy_ticks, grounded)
+        self.history = (deque(maxlen=C.INPUT_LAG_MAX + 1),
+                        deque(maxlen=C.INPUT_LAG_MAX + 1))
+
+    def _self_lag(self) -> int:
+        """Rollback: own inputs apply instantly. Delay: everything lags."""
+        return 0 if C.NETCODE == "rollback" else self.lag
 
     def reset(self, randomize_spawns=True):
         self.sim.reset(randomize_spawns)
@@ -86,17 +108,28 @@ class LagEnv:
         # Heavy resets to full at spawn and everyone knows it.
         self.heavy_seen = [1.0, 1.0]
         self.heavy_seen_ticks = [0, 0]
+        # Seed the history with the spawn state: at t=0 the clients are synced,
+        # and early ticks lag as far as real time allows (t-lag clamps to spawn).
+        for p in (0, 1):
+            self.history[p].clear()
+            self.history[p].append(self._snapshot(p, IDLE))
         # Per-episode lag randomization: the agent can't observe the draw, so it
         # must learn timing robust to the whole range.
         if C.INPUT_LAG_RANDOM:
             self.lag = random.randint(C.INPUT_LAG_MIN, C.INPUT_LAG_MAX)
 
+    def _snapshot(self, p: int, applied_idx: int):
+        pl = self.sim.players[p]
+        return (pl.pos[0], pl.pos[1], pl.vel[0], pl.vel[1], applied_idx,
+                pl.heavy_power, self.heavy_seen[p], self.heavy_seen_ticks[p],
+                pl.is_grounded())
+
     def set_decision(self, seat: int, action: int):
         self.decisions[seat].append((self.episode_steps, action))
 
-    def _applied_index(self, seat: int) -> int:
+    def _applied_index(self, seat: int, lag: int) -> int:
         """Latest decision old enough to have taken effect (t <= now - lag)."""
-        cutoff = self.episode_steps - self.lag
+        cutoff = self.episode_steps - lag
         log = self.decisions[seat]
         applied = IDLE
         keep_from = 0
@@ -116,11 +149,13 @@ class LagEnv:
         return log[-1][1] if log else IDLE
 
     def applied_actions(self):
-        return [self._applied_index(0), self._applied_index(1)]
+        lag = self._self_lag()
+        return [self._applied_index(0, lag), self._applied_index(1, lag)]
 
     def tick(self):
-        k0 = index_to_keys(self._applied_index(0))
-        k1 = index_to_keys(self._applied_index(1))
+        a0, a1 = self.applied_actions()
+        k0 = index_to_keys(a0)
+        k1 = index_to_keys(a1)
         self.sim.step(k0, k1)
         self.episode_steps += 1
 
@@ -132,6 +167,10 @@ class LagEnv:
                 self.heavy_seen_ticks[p] = 0
             else:
                 self.heavy_seen_ticks[p] += 1
+
+        if C.NETCODE == "rollback":
+            self.history[0].append(self._snapshot(0, a0))
+            self.history[1].append(self._snapshot(1, a1))
 
         dead = [self.sim.is_dead(0), self.sim.is_dead(1)]
         timeout = not any(dead) and self.episode_steps >= self.max_steps
@@ -147,36 +186,82 @@ class LagEnv:
                 rewards = [C.LOSS_REWARD, C.WIN_REWARD]
         return {"rewards": rewards, "done": done, "dead": dead, "timeout": timeout}
 
+    def _opp_view(self, p: int):
+        """The rollback client's rendered view of player p: their snapshot from
+        `lag` ticks ago replayed forward with held inputs. Ballistic while
+        airborne, constant-vx while grounded; collisions inside the window are
+        ignored (short window, same class of error the real predictor makes).
+        Returns (x, y, vx, vy, applied_idx, heavy_power, heavy_seen, heavy_ticks).
+        """
+        hist = self.history[p]
+        # Snapshot at t-L (hist[-1] is t), clamped to spawn early in the round.
+        L = min(self.lag, len(hist) - 1)
+        x, y, vx, vy, aidx, hp, hseen, hticks, grounded = hist[-1 - L]
+        if L == 0:
+            return x, y, vx, vy, aidx, hp, hseen, hticks
+        # Exact path: if the opponent's applied keys were constant across the
+        # whole window, the client's held-input resim reproduces reality
+        # tick-for-tick (collisions included) — so the true CURRENT state IS
+        # the prediction. This is the common case; the ballistic guess below
+        # only runs inside genuine mispredictions (keys changed in-window),
+        # where the real client's prediction is wrong by definition too.
+        if all(hist[-1 - j][4] == aidx for j in range(L)):
+            cx, cy, cvx, cvy, _, chp, chseen, chticks, _ = hist[-1]
+            return cx, cy, cvx, cvy, aidx, chp, chseen, chticks
+        if grounded:
+            x += vx * PC.DT * L
+        else:
+            for _ in range(L):
+                vy += PC.GRAVITY * PC.DT
+                x += vx * PC.DT
+                y += vy * PC.DT
+        # The prediction also runs the heavy meter forward with the held key.
+        if index_to_keys(aidx)["heavy"]:
+            hp = max(0.0, hp - PC.HEAVY_DRAIN * L)
+            hseen, hticks = hp * C.HEAVY_SCALE, 0
+        else:
+            hp = min(PC.HEAVY_MAX, hp + PC.HEAVY_REGEN * L)
+            hticks += L
+        return x, y, vx, vy, aidx, hp, hseen, hticks
+
     def decision_state(self, seat: int) -> np.ndarray:
         s = self.sim.players[seat]
-        o = self.sim.players[1 - seat]
         out = np.zeros(C.STATE_DIM, dtype=np.float32)
 
-        def block(off, pi, player, applied_idx):
+        def block(off, x, y, vx, vy, applied_idx, heavy_power, hseen, hticks):
             k = index_to_keys(applied_idx)
-            x, y = player.pos
-            vx, vy = player.vel
             out[off] = x * C.POS_SCALE
             out[off + 1] = y * C.POS_SCALE
             out[off + 2] = vx * C.VEL_SCALE
             out[off + 3] = vy * C.VEL_SCALE
-            out[off + 4] = player.heavy_power * C.HEAVY_SCALE if k["heavy"] else 0.0
+            out[off + 4] = heavy_power * C.HEAVY_SCALE if k["heavy"] else 0.0
             out[off + 5] = 1.0 if k["up"] else 0.0
             out[off + 6] = 1.0 if k["down"] else 0.0
             out[off + 7] = 1.0 if k["left"] else 0.0
             out[off + 8] = 1.0 if k["right"] else 0.0
             out[off + 9] = 1.0 if k["heavy"] else 0.0
-            out[off + 10] = self.heavy_seen[pi]
-            out[off + 11] = min(1.0, self.heavy_seen_ticks[pi]
-                                / C.HEAVY_SEEN_TICKS_NORM)
+            out[off + 10] = hseen
+            out[off + 11] = min(1.0, hticks / C.HEAVY_SEEN_TICKS_NORM)
 
-        block(0, seat, s, self._applied_index(seat))
-        block(12, 1 - seat, o, self._applied_index(1 - seat))
-
+        # Self: always the true current state (your own client is exact).
         sx, sy = s.pos
-        ox, oy = o.pos
         svx, svy = s.vel
-        ovx, ovy = o.vel
+        block(0, sx, sy, svx, svy, self._applied_index(seat, self._self_lag()),
+              s.heavy_power, self.heavy_seen[seat], self.heavy_seen_ticks[seat])
+
+        # Opponent: predicted view under rollback, true-but-key-lagged under delay.
+        if C.NETCODE == "rollback":
+            ox, oy, ovx, ovy, oaidx, ohp, ohseen, ohticks = self._opp_view(1 - seat)
+        else:
+            o = self.sim.players[1 - seat]
+            ox, oy = o.pos
+            ovx, ovy = o.vel
+            oaidx = self._applied_index(1 - seat, self.lag)
+            ohp = o.heavy_power
+            ohseen = self.heavy_seen[1 - seat]
+            ohticks = self.heavy_seen_ticks[1 - seat]
+        block(12, ox, oy, ovx, ovy, oaidx, ohp, ohseen, ohticks)
+
         out[24] = (ox - sx) * C.POS_SCALE
         out[25] = (oy - sy) * C.POS_SCALE
         out[26] = (ovx - svx) * C.VEL_SCALE

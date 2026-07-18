@@ -38,7 +38,7 @@
     // ===== bonk2 env constants (python/bonk2/config.py — keep in sync!) ======
     const POS_SCALE = 1 / 30;
     const VEL_SCALE = 1 / 30;
-    const MAX_EPISODE_STEPS = 8000;    // draw-clock horizon (ticks)
+    const MAX_EPISODE_STEPS = 3000;    // draw-clock horizon (ticks)
     const ACTION_REPEAT = 2;           // decide every 2 frames, hold between
     const HEAVY_SEEN_TICKS_NORM = 200; // full-regen span (5/tick from 0)
     const STATE_DIM = 34;

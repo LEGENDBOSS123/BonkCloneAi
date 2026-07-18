@@ -122,11 +122,14 @@ class League:
         return False
 
     # ── pool health (exploiter trigger + logging) ──────────────────────────────
-    def top_pool_winrate(self):
-        """Highest winrate any frozen agent currently holds AGAINST the main,
-        over agents with enough games. None if no agent has enough data."""
+    def top_exploiter_winrate(self):
+        """Highest winrate any EXPLOITER currently holds against the main (the
+        trigger signal). Snapshots are deliberately excluded: a recent snapshot
+        is ~the current policy and pins the max near 50% forever, which would
+        make a mastery threshold unreachable. None until an exploiter has
+        enough games."""
         rates = [1.0 - sum(a["recent"]) / len(a["recent"])
-                 for a in (self.snapshots + self.exploiters)
+                 for a in self.exploiters
                  if len(a["recent"]) >= C.EXPLOITER_TRIGGER_MIN_GAMES]
         return max(rates) if rates else None
 
@@ -147,13 +150,14 @@ class League:
 
     # ── exploiter phase machine ────────────────────────────────────────────────
     def should_start_exploiter(self):
-        """Mastery trigger, bounded by min/max spacing (see config)."""
+        """Mastery trigger, bounded by min/max spacing: spawn once no existing
+        exploiter still beats the main by EXPLOITER_TRIGGER_WR or more."""
         gap = self.main_ep_total - self.last_exploiter_ep
         if gap < C.EXPLOITER_MIN_INTERVAL:
             return False                    # let the main absorb the last one
         if gap >= C.EXPLOITER_MAX_INTERVAL:
             return True                     # diversity floor — find a new hole
-        top = self.top_pool_winrate()
+        top = self.top_exploiter_winrate()
         return top is not None and top < C.EXPLOITER_TRIGGER_WR
 
     def start_exploiter(self):

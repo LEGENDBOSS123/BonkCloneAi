@@ -1,0 +1,9 @@
+
+Pause:
+pkill -STOP -f "run_killingposts_ppo8_pipeline"   # the wrapper
+pkill -STOP -f "ppo8.train"                        # the trainer
+pkill -STOP -f "multiprocessing.spawn"             # the workers
+Continue:
+pkill -CONT -f "multiprocessing.spawn"
+pkill -CONT -f "ppo8.train"
+pkill -CONT -f "run_killingposts_ppo8_pipeline"

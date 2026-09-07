@@ -6,9 +6,10 @@
 //   1. The bonk.io instrumentation from Bonk1v1Ai must already be injected:
 //      top.playerids, top.myid, top.scale, top.presskeys, top.MAKE_KEYS,
 //      top.GET_KEYS, top.RECIEVEFUNCTION (and ideally top.getCurrentFrame).
-//   2. Network access (loads @tensorflow/tfjs from jsDelivr once).
-//   3. Paste AFTER the instrumentation; pick the checkpoint in the file dialog.
+//   2. Paste AFTER the instrumentation; pick the checkpoint in the file dialog.
 //      Stop with top.bonkai.playStop().
+//
+// No network access needed: inference is plain JS, no TensorFlow, no CDN.
 //
 // OBSERVATION must match python/bonk2/env.py, 34 dims:
 //   [ 0-11] self : x,y,vx,vy, heavyValue(masked), up,down,left,right,heavy,
@@ -28,7 +29,7 @@
     top.bonkai = top.bonkai || {};
 
     // ===== Coordinate conversion (calibrated in play.mjs — see its notes) ====
-    const PPM = 15;                    // map1.json physics.ppm
+    const PPM = 10;                    // map1.json physics.ppm
     const ORIGIN_X = 365, ORIGIN_Y = 250; // live map-coords of the map center
     // bonk's playerData2.xvel is a finite difference in position-units per
     // MILLISECOND, so m/s = xvel * 1000 / (top.scale * PPM).
@@ -68,69 +69,192 @@
     // ===== Local state =========================================================
     const keyMap = new Map();          // playerId -> encoded key int (from packets)
     const heavyTrack = new Map();      // playerId -> { seen: 0..1, seenAtTick }
-    let tf = null;
     let policy = null;
+    let hiddenState = null;   // GRU state; null for feedforward
     let running = false;
     let lastMove = { left: false, right: false, up: false, down: false, heavy: false, special: false };
     let lastSent = { up: 0, down: 0, left: 0, right: 0, heavy: 0 }; // pending block
     let roundStartFrame = null;        // for the draw clock + heavy tracker
     let roundStartMs = 0;
 
-    // ===== TensorFlow.js ======================================================
-    function loadTf() {
-        if (window.tf) return Promise.resolve(window.tf);
-        return new Promise((resolve, reject) => {
-            const s = document.createElement("script");
-            s.src = "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js";
-            s.onload = () => resolve(window.tf);
-            s.onerror = () => reject(new Error("failed to load tfjs from CDN"));
-            document.head.appendChild(s);
-        });
-    }
+    // ===== Inference: plain JS, no TensorFlow =================================
+    // The actor is ~79k MACs. Pulling 1 MB of tfjs from a CDN to run that cost
+    // us a WebGL backend fighting the game's renderer, an async readback worth
+    // ~2 frames of input lag, and (for the GRU) Keras's gate order silently
+    // disagreeing with PyTorch's. This is the same code as
+    // python/bonk3/tools/net.mjs, which is parity-tested against PyTorch to
+    // ~1e-8; keep the two in sync (tools/test_net_parity.mjs checks for drift).
+    // Bonus: the script is now fully self-contained — no network dependency.
 
-    // Rebuild the policy exactly like python/bonk/networks.py MLP:
-    //   [Dense(no bias) -> LayerNorm(eps 1e-3) -> relu] x hidden -> Dense(+bias)
-    // Weight record order: k0, ln0_g, ln0_b, k1, ln1_g, ln1_b, ..., kout, bout.
-    // Architecture is inferred from the shapes, so any hidden size loads.
-    function buildPolicy(weights) {
-        const kernels = weights.filter((w) => w.shape.length === 2);
-        const stateDim = kernels[0].shape[0];
-        const actionDim = kernels[kernels.length - 1].shape[1];
-        const hidden = kernels.slice(0, -1).map((k) => k.shape[1]);
+    // ── primitives ───────────────────────────────────────────────────────────────
 
-        const input = tf.input({ shape: [stateDim] });
-        let x = input;
-        hidden.forEach((units, i) => {
-            x = tf.layers.dense({ units, useBias: false, name: `pol_dense${i}` }).apply(x);
-            x = tf.layers.layerNormalization({ epsilon: 1e-3, name: `pol_ln${i}` }).apply(x);
-            x = tf.layers.activation({ activation: "relu", name: `pol_act${i}` }).apply(x);
-        });
-        const out = tf.layers.dense({ units: actionDim, name: "pol_out" }).apply(x);
-        const model = tf.model({ inputs: input, outputs: out, name: "policy" });
-
-        const tensors = weights.map((w) => tf.tensor(w.data, w.shape));
-        model.setWeights(tensors);
-        tensors.forEach((t) => t.dispose());
-        console.log(`policy built: ${stateDim}->${hidden.join("->")}->${actionDim}`);
-        if (stateDim !== STATE_DIM) console.warn(`expected obs dim ${STATE_DIM}, save says ${stateDim} — v1 model? use play2.mjs for those`);
-        return model;
-    }
-
-    // One action index from the logits (argmax, or softmax sample).
-    async function predict(obs) {
-        const t = tf.tidy(() => policy.predict(tf.tensor2d([obs])));
-        const logits = Array.from(await t.data());
-        t.dispose();
-        if (GREEDY) {
-            let best = 0;
-            for (let a = 1; a < logits.length; a++) if (logits[a] > logits[best]) best = a;
-            return best;
+    // Kernel in tfjs record layout: flat [in, out], row-major. y = xW.
+    function matvecTfjs(kernel, inDim, outDim, x, bias) {
+        const y = new Float32Array(outDim);
+        if (bias) y.set(bias);
+        for (let i = 0; i < inDim; i++) {
+            const xi = x[i];
+            if (xi === 0) continue;
+            const row = i * outDim;
+            for (let j = 0; j < outDim; j++) y[j] += xi * kernel[row + j];
         }
-        const m = Math.max(...logits);
-        const ps = logits.map((z) => Math.exp(z - m));
-        let r = Math.random() * ps.reduce((a, b) => a + b, 0);
-        for (let a = 0; a < ps.length; a++) { r -= ps[a]; if (r <= 0) return a; }
-        return ps.length - 1;
+        return y;
+    }
+
+    // Torch Linear layout: nested [out][in]. y = Wx + b.
+    function matvecTorch(W, x, bias) {
+        const outDim = W.length;
+        const y = new Float32Array(outDim);
+        for (let j = 0; j < outDim; j++) {
+            const row = W[j];
+            let s = bias ? bias[j] : 0;
+            for (let i = 0; i < row.length; i++) s += row[i] * x[i];
+            y[j] = s;
+        }
+        return y;
+    }
+
+    // Matches torch.nn.LayerNorm: biased variance (divide by N, not N-1).
+    function layerNorm(x, gamma, beta, eps = 1e-3) {
+        const n = x.length;
+        let mean = 0;
+        for (let i = 0; i < n; i++) mean += x[i];
+        mean /= n;
+        let varc = 0;
+        for (let i = 0; i < n; i++) { const d = x[i] - mean; varc += d * d; }
+        varc /= n;
+        const inv = 1 / Math.sqrt(varc + eps);
+        const y = new Float32Array(n);
+        for (let i = 0; i < n; i++) y[i] = (x[i] - mean) * inv * gamma[i] + beta[i];
+        return y;
+    }
+
+    function relu(x) {
+        const y = new Float32Array(x.length);
+        for (let i = 0; i < x.length; i++) y[i] = x[i] > 0 ? x[i] : 0;
+        return y;
+    }
+
+    const sigmoid = (v) => 1 / (1 + Math.exp(-v));
+
+    // ── feedforward actor (tfjs record format) ───────────────────────────────────
+    // Records: k0, ln0_g, ln0_b, k1, ln1_g, ln1_b, ..., k_out, b_out.
+    // Layer block = [Linear(no bias) -> LayerNorm(eps 1e-3) -> ReLU], then a final
+    // Linear WITH bias. Same structure as bonk/networks.py MLP.
+    function buildMLP(records) {
+        const layers = [];
+        let i = 0;
+        while (i + 3 < records.length) {           // a trailing kernel+bias remain
+            layers.push({
+                k: Float32Array.from(records[i].data),
+                inDim: records[i].shape[0], outDim: records[i].shape[1],
+                g: Float32Array.from(records[i + 1].data),
+                b: Float32Array.from(records[i + 2].data),
+            });
+            i += 3;
+        }
+        const outK = records[i], outB = records[i + 1];
+        return {
+            layers,
+            outK: Float32Array.from(outK.data),
+            outIn: outK.shape[0], outOut: outK.shape[1],
+            outB: Float32Array.from(outB.data),
+            stateDim: layers.length ? layers[0].inDim : outK.shape[0],
+            actionDim: outK.shape[1],
+        };
+    }
+
+    function mlpForward(net, obs) {
+        let x = Float32Array.from(obs);
+        for (const L of net.layers) {
+            x = relu(layerNorm(matvecTfjs(L.k, L.inDim, L.outDim, x, null), L.g, L.b));
+        }
+        return matvecTfjs(net.outK, net.outIn, net.outOut, x, net.outB);
+    }
+
+    // ── recurrent actor (RecurrentAC.to_records) ─────────────────────────────────
+    function buildGRU(obj) {
+        const t = obj.tensors;
+        const enc = [];
+        // enc is Sequential(Linear(no bias), LayerNorm, ReLU) repeated.
+        for (let li = 0; ; li += 3) {
+            if (!(`enc.${li}.weight` in t)) break;
+            enc.push({
+                W: t[`enc.${li}.weight`],
+                g: t[`enc.${li + 1}.weight`],
+                b: t[`enc.${li + 1}.bias`],
+            });
+        }
+        return {
+            enc,
+            Wih: t["cell.weight_ih"], Whh: t["cell.weight_hh"],
+            bih: t["cell.bias_ih"], bhh: t["cell.bias_hh"],
+            piW: t["pi.weight"], piB: t["pi.bias"],
+            hidden: obj.hidden, stateDim: obj.stateDim, actionDim: obj.numActions,
+        };
+    }
+
+    // EXACT torch.nn.GRUCell semantics. Gate order in weight_ih/weight_hh is
+    // [r, z, n]; crucially the reset gate multiplies (W_hn h + b_hn) INCLUDING the
+    // hidden bias. Keras orders gates (z, r, h) and applies the reset differently —
+    // that mismatch is the classic silent-corruption bug this avoids.
+    function gruStep(net, obs, h) {
+        let x = Float32Array.from(obs);
+        for (const L of net.enc) x = relu(layerNorm(matvecTorch(L.W, x, null), L.g, L.b));
+
+        const H = net.hidden;
+        const gi = matvecTorch(net.Wih, x, net.bih);   // [3H]
+        const gh = matvecTorch(net.Whh, h, net.bhh);   // [3H]
+        const hn = new Float32Array(H);
+        for (let j = 0; j < H; j++) {
+            const r = sigmoid(gi[j] + gh[j]);
+            const z = sigmoid(gi[H + j] + gh[H + j]);
+            const n = Math.tanh(gi[2 * H + j] + r * gh[2 * H + j]);
+            hn[j] = (1 - z) * n + z * h[j];
+        }
+        return { logits: matvecTorch(net.piW, hn, net.piB), h: hn };
+    }
+
+    // ── unified entry ────────────────────────────────────────────────────────────
+    function buildPolicy(save) {
+        const agent = save.agent || save;
+        if (agent.recurrent) {
+            const net = buildGRU(agent.recurrent);
+            return { kind: "gru", net, hidden: net.hidden,
+                     stateDim: net.stateDim, actionDim: net.actionDim };
+        }
+        const net = buildMLP(agent.actor);
+        return { kind: "mlp", net, hidden: 0,
+                 stateDim: net.stateDim, actionDim: net.actionDim };
+    }
+
+    function policyStep(p, obs, h) {
+        if (p.kind === "gru") return gruStep(p.net, obs, h);
+        return { logits: mlpForward(p.net, obs), h };
+    }
+
+    function argmax(a) {
+        let b = 0;
+        for (let i = 1; i < a.length; i++) if (a[i] > a[b]) b = i;
+        return b;
+    }
+
+    function sampleSoftmax(a) {
+        let m = -Infinity;
+        for (const v of a) if (v > m) m = v;
+        let sum = 0;
+        const p = new Float64Array(a.length);
+        for (let i = 0; i < a.length; i++) { p[i] = Math.exp(a[i] - m); sum += p[i]; }
+        let r = Math.random() * sum;
+        for (let i = 0; i < a.length; i++) { r -= p[i]; if (r <= 0) return i; }
+        return a.length - 1;
+    }
+
+    // One action index from the current observation, advancing GRU state.
+    function decide(obs) {
+        const r = policyStep(policy, obs, hiddenState);
+        hiddenState = r.h;
+        return GREEDY ? argmax(r.logits) : sampleSoftmax(r.logits);
     }
 
     // ===== Observation =========================================================
@@ -265,17 +389,19 @@
     async function main() {
         const save = await loadFile();
         const agent = save.agent || save;
-        const records = agent.actor;   // bonk2 saves are PPO-only
-        if (!records || !records.length) {
-            throw new Error(`no actor weights in save (agent keys: ${Object.keys(agent)})`);
+        if (!agent.actor && !agent.recurrent) {
+            throw new Error(`no actor/recurrent weights in save (agent keys: ${Object.keys(agent)})`);
         }
-
-        tf = await loadTf();
-        await tf.ready();
-        policy = buildPolicy(records);
+        policy = buildPolicy(save);
+        hiddenState = policy.kind === "gru" ? new Float32Array(policy.hidden) : null;
         top.bonkai.policy = policy;
+        if (policy.stateDim !== STATE_DIM) {
+            console.warn(`expected obs dim ${STATE_DIM}, save says ${policy.stateDim}` +
+                         " — v1 model? use play2.mjs for those");
+        }
         console.log(
-            `AI loaded [bonk2 actor] on tfjs (${tf.getBackend()})` +
+            `AI loaded [${policy.kind}] ${policy.stateDim}->${policy.actionDim}` +
+            (policy.kind === "gru" ? ` (hidden ${policy.hidden})` : "") +
             (save.progress ? `, episode ${save.progress.episodeCount}, ELO ${Math.round(save.progress.currentRating)}` : "") +
             `. Deciding every ${ACTION_REPEAT} frames (${GREEDY ? "greedy" : "sampled"}). ` +
             "Stop with top.bonkai.playStop().");
@@ -295,7 +421,7 @@
                 const [me, opp] = ids;
                 let actionIndex = 0;
                 try {
-                    actionIndex = await predict(buildObs(me, opp));
+                    actionIndex = decide(buildObs(me, opp));
                 } catch (err) {
                     console.error("inference error:", err);
                 }

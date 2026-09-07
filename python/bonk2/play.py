@@ -12,7 +12,7 @@ Player 2 (red) is idle by default, or driven from a training checkpoint:
 omit N or use -1 for the newest). --auto hands player 1 to the main agent.
 
 Both seats run with the training decision cadence (every ACTION_REPEAT ticks)
-and the training INPUT_LAG, so what you feel is what the agent trained in.
+and the training self/view lags, so what you feel is what it trained in.
 R = reset round, Esc = quit.
 """
 
@@ -26,7 +26,9 @@ import torch
 
 from bonk import config as PC          # physics constants (kill line, heavy mass)
 from bonk.networks import MLP
-from bonk.sim import BonkSim
+from bonk3.simadapter import make_sim
+
+from .policy import load_policy, resolve_agent
 
 from . import config as C
 from .env import LagEnv
@@ -39,52 +41,6 @@ COL_P2 = (255, 82, 82)
 COL_KILL = (255, 40, 40)
 
 
-class ActorNet:
-    """A frozen actor loaded from to_records() weights (main, snapshot, or
-    exploiter). from_records infers the architecture, so any hidden size works."""
-
-    def __init__(self, records, label):
-        self.net = MLP.from_records(records)
-        for p in self.net.parameters():
-            p.requires_grad_(False)
-        self.net.eval()
-        self.label = label
-
-    @torch.no_grad()
-    def act(self, obs, greedy=False):
-        x = torch.from_numpy(np.ascontiguousarray(obs)).float().unsqueeze(0)
-        logits = self.net(x)
-        if greedy:
-            return int(logits.argmax(1).item())
-        return int(torch.multinomial(torch.softmax(logits, 1), 1).item())
-
-
-def resolve_agent(ckpt, spec):
-    """Pull one agent's actor records + a label out of a full training
-    checkpoint. spec: main | snap[:N] | exp[:N] (N indexes the pool, default -1)."""
-    kind, _, idx = spec.strip().lower().partition(":")
-    if kind in ("main", "current", "actor"):
-        return ckpt["agent"]["actor"], "main"
-    if kind in ("snap", "snapshot"):
-        pool = ckpt.get("snapshots", [])
-        if not pool:
-            raise ValueError("checkpoint has no snapshots")
-        i = int(idx) if idx else -1
-        it = pool[i]
-        return it["weights"], f"snap[{i % len(pool)}] ep{it.get('episode', '?')}"
-    if kind in ("exp", "exploiter"):
-        pool = ckpt.get("league", {}).get("exploiters", [])
-        if not pool:
-            raise ValueError("checkpoint has no exploiters")
-        i = int(idx) if idx else -1
-        it = pool[i]
-        return (it["weights"],
-                f"exp[{i % len(pool)}] ep{it.get('episode', '?')} "
-                f"wr{it.get('winrate', 0.0):.2f}")
-    raise ValueError(f"bad --opponent spec: {spec!r} "
-                     "(want main | snap[:N] | exp[:N])")
-
-
 def keys_to_index(k):
     lr = 1 if k["left"] else 2 if k["right"] else 0
     ud = 1 if k["up"] else 2 if k["down"] else 0
@@ -93,7 +49,9 @@ def keys_to_index(k):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--map", default=str(REPO / "src/bonkmap/map1.json"))
+    ap.add_argument("--map", default=str(REPO / "src/bonkmap/map1.json"),
+                    help="legacy-engine map file; ignored when config.ENGINE "
+                         "== 'real' (that uses config.MAP_NAME)")
     ap.add_argument("--checkpoint", help="bonk2 training checkpoint JSON")
     ap.add_argument("--opponent", default="main",
                     help="who drives player 2: main | snap[:N] | exp[:N]")
@@ -103,12 +61,12 @@ def main():
     ap.add_argument("--greedy", action="store_true")
     args = ap.parse_args()
 
-    with open(args.map) as f:
-        sim = BonkSim(json.load(f))
+    sim = make_sim(C.MAP_NAME if C.ENGINE == "real" else args.map, engine=C.ENGINE)
     env = LagEnv(sim)
     env.reset(randomize_spawns=False)
 
     p0_policy = None      # drives seat 0 (cyan) — you, unless --auto
+    p1_label = "idle"
     p1_policy = None      # drives seat 1 (red)
     if args.checkpoint:
         with open(args.checkpoint) as f:
@@ -117,12 +75,13 @@ def main():
             print(f"warning: checkpoint stateDim {ckpt.get('stateDim')} != "
                   f"{C.STATE_DIM} — is this a v1 model?")
         recs, label = resolve_agent(ckpt, args.opponent)
-        p1_policy = ActorNet(recs, label)
-        print(f"player 2 (red): {label}")
+        p1_policy = load_policy(recs)
+        p1_label = label
+        print(f"player 2 (red): {label} [{p1_policy.kind}]")
         if args.auto:
             recs, _ = resolve_agent(ckpt, "main")
-            p0_policy = ActorNet(recs, "main")
-            print("player 1 (cyan): main agent (auto)")
+            p0_policy = load_policy(recs)
+            print(f"player 1 (cyan): main agent (auto) [{p0_policy.kind}]")
     elif args.auto:
         ap.error("--auto needs --checkpoint")
 
@@ -132,11 +91,24 @@ def main():
     font = pygame.font.SysFont("monospace", 14)
     clock = pygame.time.Clock()
 
-    scale = screen.get_height() / WORLD_HEIGHT
+    # Screen centre — used for on-screen text in BOTH modes, so it must not
+    # live inside a branch.
     cx, cy = screen.get_width() / 2, screen.get_height() / 2
 
-    def to_screen(x, y):
-        return int(cx + x * scale), int(cy + y * scale)
+    # ENGINE="real" draws the actual decoded bonk geometry (bonk3.render);
+    # "legacy" keeps the old approximate platform list.
+    real = C.ENGINE == "real"
+    if real:
+        from bonk3.render import Camera, MapRenderer
+        rend = MapRenderer(sim.map_data)
+        cam = Camera.fit(sim.map_data, screen.get_width(), screen.get_height())
+        scale = cam.scale
+        to_screen = cam.to_screen
+    else:
+        scale = screen.get_height() / WORLD_HEIGHT
+
+        def to_screen(x, y):
+            return int(cx + x * scale), int(cy + y * scale)
 
     score = [0, 0, 0]  # p1 wins, p2 wins, draws
     result_flash = ""
@@ -151,14 +123,17 @@ def main():
                     running = False
                 elif ev.key == pygame.K_r:
                     env.reset(randomize_spawns=False)
+                    for pol in (p0_policy, p1_policy):
+                        if pol is not None:
+                            pol.reset_env(0)
 
         on_decision = env.episode_steps % C.ACTION_REPEAT == 0
 
         # Player 1 (cyan): the main agent under --auto, else you.
         if p0_policy is not None:
             if on_decision:
-                env.set_decision(0, p0_policy.act(env.decision_state(0),
-                                                  greedy=args.greedy))
+                env.set_decision(0, int(p0_policy.act(
+                    env.decision_state(0), args.greedy)[0]))
         else:
             pressed = pygame.key.get_pressed()
             human = {
@@ -168,13 +143,13 @@ def main():
                 "right": pressed[pygame.K_RIGHT],
                 "heavy": pressed[pygame.K_x] or pressed[pygame.K_LSHIFT],
             }
-            # Human decides every tick; the env applies it INPUT_LAG ticks later.
+            # Human decides every tick; the env applies it SELF_LAG ticks later.
             env.set_decision(0, keys_to_index(human))
 
         # Player 2 (red) decides on the training cadence.
         if p1_policy is not None and on_decision:
-            env.set_decision(1, p1_policy.act(env.decision_state(1),
-                                              greedy=args.greedy))
+            env.set_decision(1, int(p1_policy.act(
+                env.decision_state(1), args.greedy)[0]))
 
         res = env.tick()
         if res["done"]:
@@ -189,10 +164,15 @@ def main():
                 result_flash = "RED WINS" if p1_policy else "YOU DIED"
             flash_until = pygame.time.get_ticks() + 1200
             env.reset(randomize_spawns=False)
+            for pol in (p0_policy, p1_policy):
+                if pol is not None:
+                    pol.reset_env(0)     # new episode, no carried memory
 
         # ── draw ───────────────────────────────────────────────────────────
         screen.fill(BG)
-        for plat in sim.platforms:
+        if real:
+            rend.draw(screen, cam)
+        for plat in ([] if real else sim.platforms):
             color = plat["color"] if plat["color"] is not None else 0x3A5A40
             rgb = ((color >> 16) & 255, (color >> 8) & 255, color & 255)
             if plat["kind"] == "box":
@@ -209,33 +189,42 @@ def main():
                 if len(pts) >= 3:
                     pygame.draw.polygon(screen, rgb, pts)
 
-        # Kill line + circle.
-        ky = int(cy + (PC.KILL_LINE_Y / sim.ppm) * scale)
-        pygame.draw.line(screen, COL_KILL, (0, ky), (screen.get_width(), ky), 1)
-        pygame.draw.circle(screen, COL_KILL, (int(cx), int(cy)),
-                           int((PC.KILL_RADIUS / sim.ppm) * scale), 1)
+        if not real:   # the real engine reports deaths directly; no kill line
+            ky = int(cy + (PC.KILL_LINE_Y / sim.ppm) * scale)
+            pygame.draw.line(screen, COL_KILL, (0, ky), (screen.get_width(), ky), 1)
+            pygame.draw.circle(screen, COL_KILL, (int(cx), int(cy)),
+                               int((PC.KILL_RADIUS / sim.ppm) * scale), 1)
 
         for i, col in ((0, COL_P1), (1, COL_P2)):
             p = sim.players[i]
-            x, y = to_screen(*p.pos)
+            # The renderer works in the engine's frame; player.pos is
+            # centre-origin (see EnginePlayer.pos), so add the offset back.
+            px, py = p.pos
+            if real:
+                px += sim.origin[0]
+                py += sim.origin[1]
+            x, y = to_screen(px, py)
             r = max(2, int(p.radius * scale))
             pygame.draw.circle(screen, col, (x, y), r)
-            heavy_frac = max(0.0, min(1.0, (p.body.mass - 1) / PC.HEAVY_EXTRA_MASS))
+            heavy_frac = ((p.heavy_power / 1000.0 if p.heavy_active else 0.0) if real
+                          else max(0.0, min(1.0, (p.body.mass - 1) / PC.HEAVY_EXTRA_MASS)))
             if heavy_frac > 0.01:
                 pygame.draw.circle(screen, (255, 255, 255), (x, y), r,
                                    max(1, int(r * 0.18 * heavy_frac + 0.5)))
 
         p1 = sim.players[0]
         cyan_name = "main" if p0_policy else "you"
-        red_name = p1_policy.label if p1_policy else "idle"
+        red_name = p1_label if p1_policy else "idle"
         hud = [
             f"score  cyan({cyan_name}) {score[0]} - {score[1]} red({red_name})"
             f"   draws {score[2]}",
             f"pos ({p1.pos[0]:6.2f},{p1.pos[1]:6.2f})  "
             f"vel ({p1.vel[0]:6.2f},{p1.vel[1]:6.2f})",
-            f"heavy {p1.heavy_power:4.0f}  mass {p1.body.mass:4.2f}  "
+            f"heavy {p1.heavy_power:4.0f}"
+            + ("" if real else f"  mass {p1.body.mass:4.2f}") + "  "
             f"tick {env.episode_steps}/{C.MAX_EPISODE_STEPS}",
-            f"lag {env.lag} ticks  cyan={cyan_name}  red={red_name}",
+            f"selfLag {env.self_lag}  viewLag {env.view_lag}  "
+            f"cyan={cyan_name}  red={red_name}",
         ]
         for j, line in enumerate(hud):
             screen.blit(font.render(line, True, (200, 240, 230)), (8, 8 + j * 17))

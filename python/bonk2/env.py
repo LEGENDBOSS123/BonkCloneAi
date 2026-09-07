@@ -1,6 +1,14 @@
 """bonk2 LagEnv: decision-level env with netcode simulation, joint discrete
 actions, normalized 34-dim observations, and sparse terminal rewards.
 
+Two independent lags model the real game (both randomized per episode):
+  SELF_LAG — your own keypress -> applied. Rollback applies your input without
+    waiting for the server, but not instantly: browser event -> frame
+    quantization -> the deploy script's own decision cadence. Training this at
+    zero is what makes contact/charge timing (heavy) land late for real.
+  VIEW_LAG — how stale your view of the OPPONENT is (the rollback prediction
+    window). Their last VIEW_LAG ticks of input haven't arrived.
+
 Netcode (config.NETCODE) — the sim-to-real bridge:
 - "rollback" (what bonk.io actually runs): both seats' inputs apply INSTANTLY
   to the authoritative sim, but each seat OBSERVES the opponent through a
@@ -81,7 +89,8 @@ def mirror_action_batch(actions: np.ndarray) -> np.ndarray:
 class LagEnv:
     def __init__(self, sim: BonkSim):
         self.sim = sim
-        self.lag = C.INPUT_LAG
+        self.self_lag = C.SELF_LAG    # own keypress -> applied (both seats)
+        self.view_lag = C.VIEW_LAG    # staleness of your view of the opponent
         self.max_steps = C.MAX_EPISODE_STEPS
         self.state_dim = C.STATE_DIM
         # Per seat: list of (decided_tick, action); pruned as entries expire.
@@ -94,12 +103,13 @@ class LagEnv:
         # Rollback: per-player state history so the opponent view can run
         # `lag` ticks behind. Snapshot per tick:
         # (x, y, vx, vy, applied_idx, heavy_power, heavy_seen, heavy_ticks, grounded)
-        self.history = (deque(maxlen=C.INPUT_LAG_MAX + 1),
-                        deque(maxlen=C.INPUT_LAG_MAX + 1))
+        self.history = (deque(maxlen=C.VIEW_LAG_MAX + 1),
+                        deque(maxlen=C.VIEW_LAG_MAX + 1))
 
     def _self_lag(self) -> int:
-        """Rollback: own inputs apply instantly. Delay: everything lags."""
-        return 0 if C.NETCODE == "rollback" else self.lag
+        """Own input delay. Under "delay" (legacy v1) the opponent view has no
+        prediction, so VIEW_LAG is folded into the input delay instead."""
+        return self.self_lag if C.NETCODE == "rollback" else self.view_lag
 
     def reset(self, randomize_spawns=True):
         self.sim.reset(randomize_spawns)
@@ -115,8 +125,25 @@ class LagEnv:
             self.history[p].append(self._snapshot(p, IDLE))
         # Per-episode lag randomization: the agent can't observe the draw, so it
         # must learn timing robust to the whole range.
-        if C.INPUT_LAG_RANDOM:
-            self.lag = random.randint(C.INPUT_LAG_MIN, C.INPUT_LAG_MAX)
+        if C.LAG_RANDOM:
+            self.self_lag = random.randint(C.SELF_LAG_MIN, C.SELF_LAG_MAX)
+            self.view_lag = random.randint(C.VIEW_LAG_MIN, C.VIEW_LAG_MAX)
+
+    def _win_reward(self) -> float:
+        """A win is worth more the SOONER it lands: WIN_REWARD scaled from 1.0
+        down to (1 - WIN_TIME_DECAY) across the episode clock.
+
+        This is where urgency belongs, not in gamma. Discounting scales wins
+        AND losses by gamma^t, so it makes dying later cheaper too — which
+        pays the agent to stall. Scaling only the win keeps the pressure
+        one-sided. The reward stays Markov because elapsed time is already an
+        observed feature (obs[33]), and it stays a single terminal reward, so
+        nothing about the sparse-reward setup changes.
+        """
+        if C.WIN_TIME_DECAY <= 0.0:
+            return C.WIN_REWARD
+        frac = min(1.0, self.episode_steps / self.max_steps)
+        return C.WIN_REWARD * (1.0 - C.WIN_TIME_DECAY * frac)
 
     def _snapshot(self, p: int, applied_idx: int):
         pl = self.sim.players[p]
@@ -176,14 +203,20 @@ class LagEnv:
         timeout = not any(dead) and self.episode_steps >= self.max_steps
         done = any(dead) or timeout
 
-        rewards = [0.0, 0.0]
+        # State-independent time cost, charged to both seats every tick. The
+        # config value is per DECISION, so split it across the ticks in a
+        # decision block — that keeps the tuned value correct if ACTION_REPEAT
+        # changes. Terminal rewards ADD to it, so orderings are preserved.
+        step_cost = -C.TIME_PENALTY / C.ACTION_REPEAT if C.TIME_PENALTY else 0.0
+        rewards = [step_cost, step_cost]
         if done:
             if timeout or (dead[0] and dead[1]):
-                rewards = [C.DRAW_REWARD, C.DRAW_REWARD]
+                term = (C.DRAW_REWARD, C.DRAW_REWARD)
             elif dead[1]:
-                rewards = [C.WIN_REWARD, C.LOSS_REWARD]
+                term = (self._win_reward(), C.LOSS_REWARD)
             else:
-                rewards = [C.LOSS_REWARD, C.WIN_REWARD]
+                term = (C.LOSS_REWARD, self._win_reward())
+            rewards = [rewards[0] + term[0], rewards[1] + term[1]]
         return {"rewards": rewards, "done": done, "dead": dead, "timeout": timeout}
 
     def _opp_view(self, p: int):
@@ -195,7 +228,7 @@ class LagEnv:
         """
         hist = self.history[p]
         # Snapshot at t-L (hist[-1] is t), clamped to spawn early in the round.
-        L = min(self.lag, len(hist) - 1)
+        L = min(self.view_lag, len(hist) - 1)
         x, y, vx, vy, aidx, hp, hseen, hticks, grounded = hist[-1 - L]
         if L == 0:
             return x, y, vx, vy, aidx, hp, hseen, hticks
@@ -256,7 +289,7 @@ class LagEnv:
             o = self.sim.players[1 - seat]
             ox, oy = o.pos
             ovx, ovy = o.vel
-            oaidx = self._applied_index(1 - seat, self.lag)
+            oaidx = self._applied_index(1 - seat, self.view_lag)
             ohp = o.heavy_power
             ohseen = self.heavy_seen[1 - seat]
             ohticks = self.heavy_seen_ticks[1 - seat]

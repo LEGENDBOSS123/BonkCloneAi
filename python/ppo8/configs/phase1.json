@@ -1,0 +1,6 @@
+{
+  "_comment": "Phases 1 & 2 (from-scratch curriculum + critic warmup): GENTLE, stable updates. Big steps collapse a from-scratch policy.",
+  "CLIP_EPS": 0.2,
+  "ACTOR_LR": 2e-4,
+  "EPOCHS": 2
+}

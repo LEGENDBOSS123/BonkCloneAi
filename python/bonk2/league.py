@@ -67,24 +67,26 @@ class League:
 
     @staticmethod
     def _snap_weight(s):
-        """PFSP weight for a past self = the main's live loss rate against it
-        (floored so solved ones never fully vanish); neutral prior until enough
-        games exist, so fresh snapshots gather data first."""
+        """PFSP weight for a past self = the main's live loss rate against it,
+        floored (so solved ones never fully vanish) then raised to PFSP_POWER
+        (so the few that still beat the main dominate the draw). Neutral prior
+        until enough games exist, so fresh snapshots gather data first."""
         r = s["recent"]
         if len(r) >= C.PFSP_MIN_GAMES:
-            return max(1.0 - sum(r) / len(r), C.PFSP_SNAP_FLOOR)
-        return C.PFSP_SNAP_PRIOR
+            return max(1.0 - sum(r) / len(r), C.PFSP_SNAP_FLOOR) ** C.PFSP_POWER
+        return C.PFSP_SNAP_PRIOR ** C.PFSP_POWER
 
     @staticmethod
     def _exp_weight(e):
         """PFSP weight for an exploiter = live loss rate, falling back to its
-        graduation winrate until enough games exist."""
+        graduation winrate until enough games exist. Same floor-then-power
+        shaping as _snap_weight."""
         r = e["recent"]
         if len(r) >= C.PFSP_MIN_GAMES:
             wr = 1.0 - sum(r) / len(r)
         else:
             wr = e["winrate"]
-        return max(wr, C.PFSP_EXP_FLOOR)
+        return max(wr, C.PFSP_EXP_FLOOR) ** C.PFSP_POWER
 
     def opponent_net(self, kind, idx):
         if kind == "snap":
@@ -113,7 +115,8 @@ class League:
         oldest snapshot was evicted (caller must shift in-flight snap indices)."""
         if self.main_ep_total % C.SNAPSHOT_INTERVAL != 0:
             return False
-        self.snapshots.append({"net": self._freeze(self.agent.actor),
+        snap_src = self.agent.net if C.RECURRENT else self.agent.actor
+        self.snapshots.append({"net": self._freeze(snap_src),
                                "rating": self.current_rating,
                                "episode": episode_count, "recent": []})
         if len(self.snapshots) > C.SNAPSHOT_BUFFER:
@@ -162,12 +165,22 @@ class League:
 
     def start_exploiter(self):
         # frozen_main answers whole-E batches every cycle -> agent's device.
-        self.frozen_main = self._freeze(self.agent.actor, self.agent.device)
-        self.exp_agent = PPOAgent(self.agent.state_dim, self.agent.num_actions,
-                                  device=str(self.agent.device))
-        if C.EXPLOITER_WARM_START:
-            self.exp_agent.actor.load_state_dict(self.agent.actor.state_dict())
-            self.exp_agent.critic.load_state_dict(self.agent.critic.state_dict())
+        src = self.agent.net if C.RECURRENT else self.agent.actor
+        self.frozen_main = self._freeze(src, self.agent.device)
+        if C.RECURRENT:
+            from .recurrent import RecurrentAgent
+            self.exp_agent = RecurrentAgent(self.agent.state_dim,
+                                            self.agent.num_actions,
+                                            device=str(self.agent.device))
+            if C.EXPLOITER_WARM_START:
+                self.exp_agent.net.load_state_dict(self.agent.net.state_dict())
+        else:
+            self.exp_agent = PPOAgent(self.agent.state_dim, self.agent.num_actions,
+                                      device=str(self.agent.device))
+            if C.EXPLOITER_WARM_START:
+                # PPOAgent owns which tensors exist (a shared trunk has a value
+                # HEAD where separate nets have a whole critic MLP).
+                self.exp_agent.warm_start_from(self.agent)
         self.phase = "exploiter"
         self.phase_eps = 0
         self.exp_recent = []
@@ -204,7 +217,8 @@ class League:
         """Graduate the exploiter into the pool. Returns True if the oldest
         exploiter was evicted (caller must shift in-flight exp indices)."""
         wr = self.exp_win_rate()
-        self.exploiters.append({"net": self._freeze(self.exp_agent.actor),
+        exp_src = self.exp_agent.net if C.RECURRENT else self.exp_agent.actor
+        self.exploiters.append({"net": self._freeze(exp_src),
                                 "episode": episode_count, "winrate": wr,
                                 "recent": []})
         evicted = False
@@ -234,12 +248,18 @@ class League:
         return (sum(self.exp_recent) / len(self.exp_recent)) if self.exp_recent else 0.0
 
     # ── helpers / persistence ──────────────────────────────────────────────────
+    def _new_net(self):
+        if C.RECURRENT:
+            from .recurrent import RecurrentAC
+            return RecurrentAC(self.agent.state_dim, self.agent.num_actions)
+        return MLP(self.agent.state_dim, C.HIDDEN, self.agent.num_actions)
+
     def _freeze(self, src_net, device="cpu"):
         """Default CPU: pool nets serve many SMALL per-net batches, where GPU
         dispatch overhead loses to CPU (measured ~6x worse on MPS). frozen_main
         is the exception — it sees whole-E batches, so it rides the agent's
         device."""
-        net = MLP(self.agent.state_dim, C.HIDDEN, self.agent.num_actions)
+        net = self._new_net()
         net.load_state_dict({k: v.cpu() for k, v in src_net.state_dict().items()})
         net.to(device)
         for p in net.parameters():
@@ -269,7 +289,16 @@ class League:
 
     def load(self, obj, episode_count):
         def frozen(records):
-            net = MLP.from_records(records)   # pool nets live on CPU (see _freeze)
+            # Pool nets live on CPU (see _freeze). Recurrent nets serialize as a
+            # dict of named tensors, feedforward ones as a tfjs record LIST —
+            # MLP.from_records cannot read the former, so dispatch on the shape
+            # of the payload rather than on config (a checkpoint must load as
+            # whatever it was saved as).
+            if isinstance(records, dict):
+                net = self._new_net()
+                net.load_records(records)
+            else:
+                net = MLP.from_records(records)
             for p in net.parameters():
                 p.requires_grad_(False)
             return net

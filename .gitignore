@@ -5,7 +5,7 @@ python/.venv/
 
 # Node
 node_modules/
-
+config.py
 # Training outputs — full checkpoints are 100+ MB each (they bundle the whole
 # snapshot + exploiter pool). Don't commit them; ship a slim model in models/
 # via `python -m bonk.export_model` instead.
@@ -21,3 +21,18 @@ message.txt
 *.swp
 .idea/
 .vscode/
+
+# bonk-recreation build outputs (the Rust engine is built locally via
+# python/bonk3/build.sh; box2dweb-rs is a private submodule)
+bonk-recreation/**/target/
+bonk-recreation/**/node_modules/
+# Decoded maps are regenerable from maps.json via tools/decode_maps.mjs;
+# keep the two we actually use, ignore bulk --all dumps.
+python/bonk3/maps/[0-9][0-9][0-9][0-9]-*.json
+
+
+run_*.sh
+
+test_*
+models/*
+blog/*

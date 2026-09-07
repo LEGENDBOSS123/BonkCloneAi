@@ -17,18 +17,19 @@ import json
 from pathlib import Path
 
 import numpy as np
-import torch
 
-from bonk.networks import MLP
-from bonk.sim import BonkSim
+from bonk3.simadapter import make_sim
 
 from . import config as C
 from .env import LagEnv
+from .policy import load_policy, resolve_agent
 
 REPO = Path(__file__).resolve().parents[2]
 
 
 def load_actor(path_glob: str):
+    """Returns (weights, path). Architecture is detected at build time by
+    load_policy, so recurrent and feedforward checkpoints both work."""
     matches = sorted(glob.glob(path_glob))
     if not matches:
         raise FileNotFoundError(path_glob)
@@ -38,26 +39,22 @@ def load_actor(path_glob: str):
     if obj.get("stateDim") not in (None, C.STATE_DIM):
         raise ValueError(f"{path}: stateDim {obj.get('stateDim')} != "
                          f"{C.STATE_DIM} (v1 checkpoint?)")
-    net = MLP.from_records(obj["agent"]["actor"])
-    for p in net.parameters():
-        p.requires_grad_(False)
-    net.eval()
-    return net, path
+    weights, _ = resolve_agent(obj, "main")
+    return weights, path
 
 
-@torch.no_grad()
-def act(net: MLP, states: np.ndarray, greedy: bool) -> np.ndarray:
-    x = torch.from_numpy(np.ascontiguousarray(states)).float()
-    logits = net(x)
-    if greedy:
-        return logits.argmax(1).numpy()
-    return torch.multinomial(torch.softmax(logits, 1), 1).squeeze(1).numpy()
-
-
-def play(net0: MLP, net1: MLP, map_json: dict, n_games: int, n_envs: int,
+def play(w0_weights, w1_weights, map_json: dict, n_games: int, n_envs: int,
          greedy: bool):
-    """net0 on seat 0, net1 on seat 1. Returns (net0_wins, net1_wins, draws)."""
-    envs = [LagEnv(BonkSim(map_json)) for _ in range(n_envs)]
+    """seat 0 vs seat 1. Returns (seat0_wins, seat1_wins, draws).
+
+    Policies are rebuilt here so each side gets its own hidden state, sized to
+    n_envs. A recurrent policy MUST have that state cleared per env when its
+    episode ends, or memory bleeds across games."""
+    pol0, pol1 = load_policy(w0_weights), load_policy(w1_weights)
+    pol0.reset(n_envs)
+    pol1.reset(n_envs)
+    src = C.MAP_NAME if C.ENGINE == "real" else map_json
+    envs = [LagEnv(make_sim(src, engine=C.ENGINE)) for _ in range(n_envs)]
     for e in envs:
         e.reset()
     w0 = w1 = draw = done_games = 0
@@ -66,12 +63,12 @@ def play(net0: MLP, net1: MLP, map_json: dict, n_games: int, n_envs: int,
         if tick % C.ACTION_REPEAT == 0:
             s0 = np.stack([e.decision_state(0) for e in envs])
             s1 = np.stack([e.decision_state(1) for e in envs])
-            a0 = act(net0, s0, greedy)
-            a1 = act(net1, s1, greedy)
+            a0 = pol0.act(s0, greedy)
+            a1 = pol1.act(s1, greedy)
             for i, e in enumerate(envs):
                 e.set_decision(0, int(a0[i]))
                 e.set_decision(1, int(a1[i]))
-        for e in envs:
+        for i, e in enumerate(envs):
             res = e.tick()
             if res["done"]:
                 dead0, dead1 = res["dead"]
@@ -83,6 +80,8 @@ def play(net0: MLP, net1: MLP, map_json: dict, n_games: int, n_envs: int,
                     w1 += 1
                 done_games += 1
                 e.reset()
+                pol0.reset_env(i)
+                pol1.reset_env(i)
         tick += 1
     return w0, w1, draw
 
@@ -91,7 +90,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--a", required=True, help="checkpoint glob for agent A")
     ap.add_argument("--b", required=True, help="checkpoint glob for agent B")
-    ap.add_argument("--map", default=str(REPO / "src/bonkmap/map1.json"))
+    ap.add_argument("--map", default=str(REPO / "src/bonkmap/map1.json"),
+                    help="legacy-engine map file; ignored when config.ENGINE "
+                         "== 'real' (that uses config.MAP_NAME)")
     ap.add_argument("--games", type=int, default=2000)
     ap.add_argument("--envs", type=int, default=64)
     ap.add_argument("--greedy", action="store_true",
@@ -100,12 +101,18 @@ def main():
 
     net_a, path_a = load_actor(args.a)
     net_b, path_b = load_actor(args.b)
-    with open(args.map) as f:
-        map_json = json.load(f)
+    # The real engine loads its own decoded map by name; only the legacy
+    # backend needs this file, so don't fail on a missing one.
+    map_json = None
+    if C.ENGINE != "real":
+        with open(args.map) as f:
+            map_json = json.load(f)
     print(f"A = {Path(path_a).name}")
     print(f"B = {Path(path_b).name}")
+    print(f"engine {C.ENGINE}"
+          + (f" map {C.MAP_NAME}" if C.ENGINE == "real" else ""))
     print(f"{args.games} games/side, {'greedy' if args.greedy else 'sampled'}, "
-          f"lag {'randomized' if C.INPUT_LAG_RANDOM else C.INPUT_LAG}")
+          f"lag {'randomized' if C.LAG_RANDOM else f'self {C.SELF_LAG} view {C.VIEW_LAG}'}")
 
     # Side 1: A on seat 0. Side 2: A on seat 1 (swap to cancel spawn bias).
     a_w1, b_w1, d1 = play(net_a, net_b, map_json, args.games, args.envs,

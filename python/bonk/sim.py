@@ -44,6 +44,17 @@ class _RestitutionMixer(b2ContactListener):
 
 
 class _GroundRay(b2RayCastCallback):
+    """Downward ground probe. Always skips the caster's own fixture. If
+    config.JUMP_OFF_PLAYERS is False it also skips ALL player fixtures, so
+    standing on an opponent's head doesn't count as grounded and can't be
+    used to jump.
+
+    NOTE ON PARITY: the JS reference (src/entities/player.mjs isGrounded)
+    excludes only `this.collider`, so players ARE jumpable there. Setting
+    JUMP_OFF_PLAYERS = False intentionally diverges from it — re-verify with
+    verify_replay.py before trusting any JS-recorded replay again.
+    """
+
     def __init__(self, exclude_fixture):
         super().__init__()
         self.exclude = exclude_fixture
@@ -52,6 +63,8 @@ class _GroundRay(b2RayCastCallback):
     def ReportFixture(self, fixture, point, normal, fraction):  # noqa: N802
         if fixture == self.exclude:
             return -1  # skip self, keep searching
+        if not C.JUMP_OFF_PLAYERS and getattr(fixture, "userData", None) == "player":
+            return -1  # opponents are not a floor, keep searching past them
         self.hit = True
         return fraction  # clip to nearest (existence is all we need)
 
@@ -81,6 +94,7 @@ class Player:
             friction=C.BALL_FRICTION,
             restitution=C.BALL_RESTITUTION,
         )
+        self.fixture.userData = "player"   # tags this fixture for _GroundRay
         self._set_mass(1.0)
 
     def _set_mass(self, mass: float):

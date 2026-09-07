@@ -5,10 +5,19 @@ brawler. Read this before making changes; the constraints below are load-bearing
 design decisions, not accidents.
 
 ## The two hard constraints (do not violate without being asked)
-1. **Sparse terminal rewards only.** `+1`/`−1`/`−0.5` at round end, nothing else
-   (`config.py`: `WIN_REWARD`/`LOSS_REWARD`/`DRAW_REWARD`). No reward shaping,
-   no intrinsic bonuses, no potential-based tricks — the whole experiment is
-   "can sparse rewards + minimal input beat humans."
+1. **No hardcoded state-dependent rule rewards.** The outcome reward is
+   `+1`/`−1`/`−0.5` at round end (`config.py`: `WIN_REWARD`/`LOSS_REWARD`/
+   `DRAW_REWARD`). What is banned is any hand-written rule paying the agent for
+   a game feature a person picked out — "closer to the opponent", "facing
+   them", "heavy charged". Each of those injects a human theory of how bonk is
+   played, and the experiment is whether the agent finds that out itself.
+   **Allowed:** a state-independent time cost (`WIN_TIME_DECAY`, `TIME_PENALTY`
+   — same class as gamma); a *learned* intrinsic reward such as RND novelty
+   over the agent's own observation block (task-agnostic, no bonk knowledge);
+   and return-equivalent transforms like RUDDER, which provably preserve the
+   optimal policy.
+   **The test:** could someone who has never played bonk write this term? If
+   yes it is allowed; if it required knowing what a good player does, it is not.
 2. **Minimal, map-agnostic observation.** 30 floats, no hand-coded features
    specific to a map. See the obs layout in `env2.py` (self 10 / opp 10 / rel 4 /
    pending 5 / draw-clock 1), all normalized.

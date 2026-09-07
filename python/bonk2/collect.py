@@ -26,6 +26,7 @@ import multiprocessing as mp
 import os
 import random
 import signal
+import threading
 import time
 
 import numpy as np
@@ -44,7 +45,7 @@ class _WorkerRecorder:
         self.dir = out_dir
         self.every = every
         self.meta = {"tps": C.TPS, "actionRepeat": C.ACTION_REPEAT,
-                     "inputLag": C.INPUT_LAG}
+                     "selfLag": C.SELF_LAG, "viewLag": C.VIEW_LAG}
         self.frames = []
         self.seen = 0
 
@@ -73,7 +74,7 @@ def worker_main(wid, offset, n_envs, map_path, raws, shapes, b_obs, b_act,
     np.random.seed(seed)
     random.seed(seed)
     # Imports here so the spawned process pays them, not the parent fork point.
-    from bonk.sim import BonkSim
+    from bonk3.simadapter import make_sim
 
     from .env import LagEnv
 
@@ -82,9 +83,8 @@ def worker_main(wid, offset, n_envs, map_path, raws, shapes, b_obs, b_act,
     brew = _view(raws["brew"], np.float32, shapes["brew"])
     done = _view(raws["done"], np.float32, shapes["done"])
 
-    with open(map_path) as f:
-        map_json = json.load(f)
-    envs = [LagEnv(BonkSim(map_json)) for _ in range(n_envs)]
+    src = C.MAP_NAME if C.ENGINE == "real" else map_path
+    envs = [LagEnv(make_sim(src, engine=C.ENGINE)) for _ in range(n_envs)]
     for env in envs:
         env.reset()
 
@@ -95,8 +95,15 @@ def worker_main(wid, offset, n_envs, map_path, raws, shapes, b_obs, b_act,
         for i, env in enumerate(envs):
             obs[offset + i, 0] = env.decision_state(0)
             obs[offset + i, 1] = env.decision_state(1)
-        b_obs.wait()
-        b_act.wait()
+        # stop() aborts these barriers to wake parked workers, which raises
+        # BrokenBarrierError here. That is the normal shutdown path, not a
+        # failure — letting it propagate dumps a traceback per worker on every
+        # clean exit and buries real errors.
+        try:
+            b_obs.wait()
+            b_act.wait()
+        except threading.BrokenBarrierError:
+            return
         if stop_flag.value:
             return
 

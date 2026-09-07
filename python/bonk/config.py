@@ -14,6 +14,13 @@ MOVE_ACCEL = 12.0            # force applied per axis while a key is held
 JUMP_SPEED = 10.0            # impulse = jumpSpeed * mass, upward
 JUMP_VY_THRESHOLD = 4.0      # no jump if |vy| >= this
 GROUND_MARGIN = 0.15         # ground ray reaches radius + margin below center
+# Can a player treat another player as ground (i.e. jump off their head)?
+# True  = JS-reference behavior (src/entities/player.mjs excludes only your own
+#         collider, so an opponent under you counts as ground).
+# False = players are not a floor; the ground ray passes through them.
+# This is a deliberate DIVERGENCE from the JS sim — flip it back to True and
+# re-run verify_replay.py if you need JS parity.
+JUMP_OFF_PLAYERS = False
 HEAVY_MAX = 1000.0
 HEAVY_DRAIN = 10.0           # per tick while held
 HEAVY_REGEN = 5.0            # per tick while released

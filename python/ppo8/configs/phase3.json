@@ -1,0 +1,6 @@
+{
+  "_comment": "Phase 3 (league self-play, near-converged actor): MODERATELY aggressive for speed. Less hot than the 0.3/3e-4/4 that destabilized things.",
+  "CLIP_EPS": 0.25,
+  "ACTOR_LR": 2.5e-4,
+  "EPOCHS": 3
+}
